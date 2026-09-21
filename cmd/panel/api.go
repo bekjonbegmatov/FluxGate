@@ -312,7 +312,10 @@ func (a *App) routeAPI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.mu.Lock()
+		oldDaily, oldMonthly := s.Daily, s.Monthly
 		s.Route = v
+		rearmQuota(&s.Daily, v.DailyLimit+s.Daily.Extra, v.Threshold)
+		rearmQuota(&s.Monthly, v.MonthlyLimit+s.Monthly.Extra, v.Threshold)
 		s.mu.Unlock()
 		if e = a.ensureCert(routeCert(v), v.SNI); e == nil {
 			e = a.writeConfig()
@@ -320,6 +323,7 @@ func (a *App) routeAPI(w http.ResponseWriter, r *http.Request) {
 		if e != nil {
 			s.mu.Lock()
 			s.Route = old
+			s.Daily, s.Monthly = oldDaily, oldMonthly
 			s.mu.Unlock()
 			fail(w, 400, e.Error())
 			return
@@ -328,6 +332,7 @@ func (a *App) routeAPI(w http.ResponseWriter, r *http.Request) {
 		if e != nil {
 			s.mu.Lock()
 			s.Route = old
+			s.Daily, s.Monthly = oldDaily, oldMonthly
 			s.mu.Unlock()
 			_ = a.writeConfig()
 			fail(w, 500, e.Error())
@@ -335,6 +340,15 @@ func (a *App) routeAPI(w http.ResponseWriter, r *http.Request) {
 		}
 		if v.Paused {
 			a.closeRouteConns(s)
+		}
+		s.mu.Lock()
+		daily, monthly := s.Daily, s.Monthly
+		blocked := s.blocked()
+		s.mu.Unlock()
+		_, _ = a.db.Exec("UPDATE periods SET threshold_sent=?,exhausted_sent=? WHERE route_id=? AND kind='daily' AND key=?", boolInt(daily.ThresholdSent), boolInt(daily.ExhaustedSent), id, daily.Key)
+		_, _ = a.db.Exec("UPDATE periods SET threshold_sent=?,exhausted_sent=? WHERE route_id=? AND kind='monthly' AND key=?", boolInt(monthly.ThresholdSent), boolInt(monthly.ExhaustedSent), id, monthly.Key)
+		if blocked {
+			a.exhaust(s)
 		}
 		writeJSON(w, 200, v)
 	case "DELETE":
@@ -388,24 +402,42 @@ func (a *App) topup(w http.ResponseWriter, r *http.Request, s *RouteState) {
 	}
 	s.mu.Lock()
 	p := &s.Daily
+	baseLimit := s.Route.DailyLimit
 	if req.Kind == "monthly" {
 		p = &s.Monthly
+		baseLimit = s.Route.MonthlyLimit
 	}
+	if baseLimit <= 0 {
+		s.mu.Unlock()
+		fail(w, 400, "quota is not configured")
+		return
+	}
+	oldLimit := baseLimit + p.Extra
+	if req.Bytes > int64(^uint64(0)>>1)-oldLimit {
+		s.mu.Unlock()
+		fail(w, 400, "topup is too large")
+		return
+	}
+	previous := *p
 	wasBlocked := s.blocked()
 	p.Extra += req.Bytes
+	newLimit := baseLimit + p.Extra
+	rearmQuota(p, newLimit, s.Route.Threshold)
 	period := *p
-	nowBlocked := s.blocked()
 	rte := s.Route
-	s.mu.Unlock()
-	_, err := a.db.Exec("INSERT INTO periods(route_id,kind,key,used,extra,threshold_sent,exhausted_sent) VALUES(?,?,?,?,?,?,?) ON CONFLICT(route_id,kind,key) DO UPDATE SET extra=excluded.extra", rte.ID, req.Kind, period.Key, period.Used, period.Extra, boolInt(period.ThresholdSent), boolInt(period.ExhaustedSent))
+	_, err := a.db.Exec("INSERT INTO periods(route_id,kind,key,used,extra,threshold_sent,exhausted_sent) VALUES(?,?,?,?,?,?,?) ON CONFLICT(route_id,kind,key) DO UPDATE SET extra=excluded.extra,threshold_sent=excluded.threshold_sent,exhausted_sent=excluded.exhausted_sent", rte.ID, req.Kind, period.Key, period.Used, period.Extra, boolInt(period.ThresholdSent), boolInt(period.ExhaustedSent))
 	if err != nil {
+		*p = previous
+		s.mu.Unlock()
 		fail(w, 500, err.Error())
 		return
 	}
+	nowBlocked := s.blocked()
+	s.mu.Unlock()
 	if wasBlocked != nowBlocked {
 		_ = a.writeConfig()
 	}
-	a.notify(rte, fmt.Sprintf("Пополнение %s: +%d байт", req.Kind, req.Bytes))
+	a.notify(rte, quotaTopupMessage(req.Kind, req.Bytes, oldLimit, newLimit, period.Used))
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 func (a *App) settingsAPI(w http.ResponseWriter, r *http.Request) {

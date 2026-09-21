@@ -226,11 +226,13 @@ func (a *App) exhaust(s *RouteState) {
 	first := (daily && !s.Daily.ExhaustedSent) || (monthly && !s.Monthly.ExhaustedSent)
 	if daily && !s.Daily.ExhaustedSent {
 		s.Daily.ExhaustedSent = true
-		go a.notify(r, "Дневная квота исчерпана")
+		s.Daily.ThresholdSent = true
+		go a.notify(r, quotaExhaustedMessage("daily", s.Daily.Used, r.DailyLimit+s.Daily.Extra))
 	}
 	if monthly && !s.Monthly.ExhaustedSent {
 		s.Monthly.ExhaustedSent = true
-		go a.notify(r, "Месячная квота исчерпана")
+		s.Monthly.ThresholdSent = true
+		go a.notify(r, quotaExhaustedMessage("monthly", s.Monthly.Used, r.MonthlyLimit+s.Monthly.Extra))
 	}
 	for c := range s.conns {
 		_ = c.Close()
@@ -272,13 +274,13 @@ func (a *App) tick() {
 			s.lastUp, s.lastDown = up, down
 			s.pendingUp = 0
 			s.pendingDown = 0
-			if r.DailyLimit > 0 && !s.Daily.ThresholdSent && 100*s.Daily.Used >= int64(r.Threshold)*(r.DailyLimit+s.Daily.Extra) {
+			if r.DailyLimit > 0 && !s.Daily.ThresholdSent && !s.Daily.ExhaustedSent && quotaReachedThreshold(s.Daily.Used, r.DailyLimit+s.Daily.Extra, r.Threshold) {
 				s.Daily.ThresholdSent = true
-				go a.notify(r, "Достигнут порог дневной квоты")
+				go a.notify(r, quotaThresholdMessage("daily", s.Daily.Used, r.DailyLimit+s.Daily.Extra))
 			}
-			if r.MonthlyLimit > 0 && !s.Monthly.ThresholdSent && 100*s.Monthly.Used >= int64(r.Threshold)*(r.MonthlyLimit+s.Monthly.Extra) {
+			if r.MonthlyLimit > 0 && !s.Monthly.ThresholdSent && !s.Monthly.ExhaustedSent && quotaReachedThreshold(s.Monthly.Used, r.MonthlyLimit+s.Monthly.Extra, r.Threshold) {
 				s.Monthly.ThresholdSent = true
-				go a.notify(r, "Достигнут порог месячной квоты")
+				go a.notify(r, quotaThresholdMessage("monthly", s.Monthly.Used, r.MonthlyLimit+s.Monthly.Extra))
 			}
 			d, m := s.Daily, s.Monthly
 			s.mu.Unlock()

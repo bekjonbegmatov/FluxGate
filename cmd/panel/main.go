@@ -267,16 +267,16 @@ func (a *App) refreshPeriods(s *RouteState, now time.Time) bool {
 		old := s.Daily.Key
 		s.Daily = a.loadPeriod(s.Route.ID, "daily", dk)
 		changed = true
-		if old != "" {
-			a.notify(s.Route, "Дневная квота сброшена")
+		if old != "" && s.Route.DailyLimit > 0 {
+			a.notify(s.Route, quotaResetMessage("daily", s.Route.DailyLimit+s.Daily.Extra))
 		}
 	}
 	if s.Monthly.Key != mk {
 		old := s.Monthly.Key
 		s.Monthly = a.loadPeriod(s.Route.ID, "monthly", mk)
 		changed = true
-		if old != "" {
-			a.notify(s.Route, "Месячная квота сброшена")
+		if old != "" && s.Route.MonthlyLimit > 0 {
+			a.notify(s.Route, quotaResetMessage("monthly", s.Route.MonthlyLimit+s.Monthly.Extra))
 		}
 	}
 	return changed
