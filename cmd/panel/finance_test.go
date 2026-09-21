@@ -97,3 +97,32 @@ func TestLegacyFinanceMigration(t *testing.T) {
 		t.Fatal("legacy debt column remains")
 	}
 }
+
+func TestRenewalReminderOnPaidUntilDate(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	a := &App{db: db, secretPath: "admin", routes: map[int64]*RouteState{1: {Route: Route{ID: 1, Name: "Test", SNI: "test.example.com"}}}, location: time.UTC}
+	if err := a.initFinance(); err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec("INSERT INTO rentals(route_id,client,contact,paid_until,remind,last_reminder) VALUES(1,'Alice','@alice','2026-10-17',1,'')")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.checkRentals(time.Date(2026, 10, 17, 8, 59, 0, 0, time.UTC))
+	if got := a.rental(1).LastReminder; got != "" {
+		t.Fatalf("early reminder: %s", got)
+	}
+	a.checkRentals(time.Date(2026, 10, 17, 9, 0, 0, 0, time.UTC))
+	if got := a.rental(1).LastReminder; got != "2026-10-17" {
+		t.Fatalf("missing reminder: %s", got)
+	}
+	a.checkRentals(time.Date(2026, 10, 17, 10, 0, 0, 0, time.UTC))
+	if got := a.rental(1).LastReminder; got != "2026-10-17" {
+		t.Fatalf("duplicate reminder: %s", got)
+	}
+}
