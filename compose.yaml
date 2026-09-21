@@ -4,7 +4,7 @@ services:
     restart: unless-stopped
     ports:
       - "443:443/tcp"
-      - "127.0.0.1:9389:9389/tcp"
+      - "9389:9389/tcp"
     volumes:
       - panel-data:/data
   panel:

@@ -11,7 +11,7 @@ if [[ ! -e /etc/fluxgate/fluxgate.env ]]; then
 from pathlib import Path
 import secrets
 p=Path('/etc/fluxgate/fluxgate.env')
-p.write_text('PANEL_DATA=/var/lib/fluxgate\nPANEL_WEB=/opt/fluxgate/web\nPANEL_LISTEN=127.0.0.1:9389\nPANEL_SECRET_PATH=admin\nPANEL_DOMAIN=cubeland.top\nPANEL_TIMEZONE=UTC\nPANEL_TOKEN='+secrets.token_hex(32)+'\nPANEL_MASTER_KEY='+secrets.token_hex(32)+'\n')
+p.write_text('PANEL_DATA=/var/lib/fluxgate\nPANEL_WEB=/opt/fluxgate/web\nPANEL_LISTEN=0.0.0.0:9389\nPANEL_SECRET_PATH=admin\nPANEL_DOMAIN=cubeland.top\nPANEL_TIMEZONE=UTC\nPANEL_TOKEN='+secrets.token_hex(32)+'\nPANEL_MASTER_KEY='+secrets.token_hex(32)+'\n')
 p.chmod(0o600)
 PY
 fi
