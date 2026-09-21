@@ -4,7 +4,7 @@ services:
     restart: unless-stopped
     ports:
       - "443:443/tcp"
-      - "9389:9389/tcp"
+      - "127.0.0.1:9389:9389/tcp"
     volumes:
       - panel-data:/data
   panel:
@@ -16,7 +16,8 @@ services:
     environment:
       PANEL_DATA: /data
       PANEL_WEB: /opt/panel/web
-      PANEL_SECRET_PATH: ${PANEL_SECRET_PATH:-secretpath}
+      PANEL_SECRET_PATH: ${PANEL_SECRET_PATH:-admin}
+      PANEL_LISTEN: :9389
       PANEL_TOKEN: ${PANEL_TOKEN:?Set PANEL_TOKEN in .env}
       PANEL_MASTER_KEY: ${PANEL_MASTER_KEY:?Set PANEL_MASTER_KEY in .env}
       PANEL_TIMEZONE: ${PANEL_TIMEZONE:-UTC}

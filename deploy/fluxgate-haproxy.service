@@ -1,0 +1,16 @@
+[Unit]
+Description=Fluxgate HAProxy listener and reload watcher
+Wants=fluxgate-panel.service
+After=fluxgate-panel.service
+
+[Service]
+Type=simple
+Environment=FLUXGATE_CONFIG=/var/lib/fluxgate/haproxy.cfg
+Environment=FLUXGATE_PID=/run/fluxgate/haproxy.pid
+RuntimeDirectory=fluxgate
+ExecStart=/usr/local/libexec/fluxgate-watch
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

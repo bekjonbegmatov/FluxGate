@@ -123,12 +123,12 @@ func main() {
 	}
 	loc, err := time.LoadLocation(env("PANEL_TIMEZONE", "UTC"))
 	fatal(err)
-	a := &App{db: db, data: data, web: env("PANEL_WEB", "./web/dist"), secretPath: strings.Trim(env("PANEL_SECRET_PATH", "secretpath"), "/"), domain: strings.ToLower(env("PANEL_DOMAIN", "site.example.com")), tokenHash: sha256.Sum256([]byte(token)), master: []byte(master), location: loc, routes: map[int64]*RouteState{}, start: time.Now()}
+	a := &App{db: db, data: data, web: env("PANEL_WEB", "./web/dist"), secretPath: strings.Trim(env("PANEL_SECRET_PATH", "admin"), "/"), domain: strings.ToLower(env("PANEL_DOMAIN", "proxy.local.invalid")), tokenHash: sha256.Sum256([]byte(token)), master: []byte(master), location: loc, routes: map[int64]*RouteState{}, start: time.Now()}
 	if !validDomain(a.domain) {
 		log.Fatal("invalid PANEL_DOMAIN")
 	}
-	if !regexp.MustCompile(`^[A-Za-z0-9_-]{8,64}$`).MatchString(a.secretPath) {
-		log.Fatal("PANEL_SECRET_PATH must be 8–64 letters, digits, underscore, or dash")
+	if !regexp.MustCompile(`^[A-Za-z0-9_-]{3,64}$`).MatchString(a.secretPath) {
+		log.Fatal("PANEL_SECRET_PATH must be 3–64 letters, digits, underscore, or dash")
 	}
 	a.fallback = a.getSetting("fallback_html", `<!doctype html><html><head><meta charset="utf-8"><title>Welcome</title></head><body><h1>Welcome</h1></body></html>`)
 	a.tg = TelegramSettings{APIURL: a.getSetting("tg_api", "https://api.telegram.org"), BotToken: a.decrypt(a.getSetting("tg_token", "")), ChatID: a.getSetting("tg_chat", "")}

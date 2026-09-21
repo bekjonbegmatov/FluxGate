@@ -1,0 +1,20 @@
+[Unit]
+Description=Fluxgate control panel and traffic meter
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=fluxgate
+Group=fluxgate
+EnvironmentFile=/etc/fluxgate/fluxgate.env
+ExecStart=/usr/local/bin/fluxgate-panel
+Restart=always
+RestartSec=2
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/fluxgate
+
+[Install]
+WantedBy=multi-user.target

@@ -72,7 +72,6 @@ func (a *App) newSession() string {
 	return base64.RawURLEncoding.EncodeToString(raw) + "." + base64.RawURLEncoding.EncodeToString(h.Sum(nil))
 }
 func (a *App) serveAdmin() {
-	cert := filepath.Join(a.data, "certs", "fallback.pem")
 	mux := http.NewServeMux()
 	base := "/" + a.secretPath + "/"
 	mux.HandleFunc(base+"api/login", func(w http.ResponseWriter, r *http.Request) {
@@ -93,11 +92,11 @@ func (a *App) serveAdmin() {
 			fail(w, 401, "invalid token")
 			return
 		}
-		http.SetCookie(w, &http.Cookie{Name: "panel_session", Value: a.newSession(), Path: base, HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode, MaxAge: 86400})
+		http.SetCookie(w, &http.Cookie{Name: "panel_session", Value: a.newSession(), Path: base, HttpOnly: true, Secure: false, SameSite: http.SameSiteStrictMode, MaxAge: 86400})
 		writeJSON(w, 200, map[string]bool{"ok": true})
 	})
 	mux.HandleFunc(base+"api/logout", func(w http.ResponseWriter, r *http.Request) {
-		http.SetCookie(w, &http.Cookie{Name: "panel_session", Value: "", Path: base, HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode, MaxAge: -1})
+		http.SetCookie(w, &http.Cookie{Name: "panel_session", Value: "", Path: base, HttpOnly: true, Secure: false, SameSite: http.SameSiteStrictMode, MaxAge: -1})
 		writeJSON(w, 200, map[string]bool{"ok": true})
 	})
 	mux.HandleFunc(base+"api/me", a.auth(func(w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, map[string]bool{"ok": true}) }))
@@ -125,9 +124,10 @@ func (a *App) serveAdmin() {
 		w.Header().Set("Cache-Control", "no-store")
 		http.ServeFile(w, r, full)
 	})
-	server := &http.Server{Addr: ":9389", Handler: mux, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second}
-	log.Printf("panel listening on https://0.0.0.0:9389/%s/", a.secretPath)
-	log.Fatal(server.ListenAndServeTLS(cert, cert))
+	listen := env("PANEL_LISTEN", "127.0.0.1:9389")
+	server := &http.Server{Addr: listen, Handler: mux, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second}
+	log.Printf("panel listening on http://%s/%s/", listen, a.secretPath)
+	log.Fatal(server.ListenAndServe())
 }
 func (a *App) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
