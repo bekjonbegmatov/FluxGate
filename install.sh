@@ -41,18 +41,24 @@ else
   git -C "$install_dir" pull --ff-only
 fi
 cd "$install_dir"
-if [[ -z $(swapon --noheadings --show=NAME) ]] && [[ $(df -BG --output=avail / | tail -n 1 | tr -dc '0-9') -ge 4 ]]; then bash deploy/setup-swap.sh >/dev/null; fi
+if [[ -z $(swapon --noheadings --show=NAME) ]] && [[ $(df -BG --output=avail / | tail -n 1 | tr -dc '0-9') -ge 4 ]]; then
+  if ! bash deploy/setup-swap.sh >/dev/null; then echo "Swap setup failed; continuing without it" >&2; fi
+fi
 if [[ ! -f .env ]]; then
   umask 077
-  cat > .env <<SETTINGS
+  cat > .env.new <<SETTINGS
 PANEL_DOMAIN=$domain
 PANEL_SECRET_PATH=$secret_path
 PANEL_TOKEN=$(openssl rand -hex 32)
 PANEL_MASTER_KEY=$(openssl rand -hex 32)
 PANEL_TIMEZONE=UTC
 SETTINGS
+  chmod 600 .env.new
+  mv .env.new .env
 fi
 chmod 600 .env
+secret_path=$(sed -n 's/^PANEL_SECRET_PATH=//p' .env | head -n 1)
+if [[ -z $secret_path ]]; then secret_path=admin; fi
 docker compose -p fluxgate up -d --build
 ready=0
 for ((attempt=0; attempt<90; attempt++)); do
@@ -66,6 +72,7 @@ if [[ $ready != 1 ]]; then
 fi
 public_ip=$(curl -4fsS --max-time 5 https://api.ipify.org 2>/dev/null || true)
 if [[ -z $public_ip ]]; then public_ip=$(hostname -I | awk '{print $1}'); fi
+if [[ $public_ip == *:* ]]; then public_ip="[$public_ip]"; fi
 token=$(sed -n 's/^PANEL_TOKEN=//p' .env | head -n 1)
 printf '\nFluxGate is ready.\nURL: http://%s:9389/%s/\nToken: %s\nProject: %s\n' "$public_ip" "$secret_path" "$token" "$install_dir"
 printf 'Ports: 443/TCP and 9389/TCP. If the URL is unreachable externally, allow these ports in your hosting provider firewall.\n'
