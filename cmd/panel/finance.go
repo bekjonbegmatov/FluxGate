@@ -1,6 +1,7 @@
 package main
 
 import (
+	"database/sql"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -9,13 +10,13 @@ import (
 )
 
 type Rental struct {
-	RouteID      int64  `json:"route_id"`
-	Client       string `json:"client"`
-	Contact      string `json:"contact"`
-	DebtCents    int64  `json:"debt_cents"`
-	PaidUntil    string `json:"paid_until"`
-	Remind       bool   `json:"remind"`
-	LastReminder string `json:"last_reminder"`
+	RouteID        int64  `json:"route_id"`
+	Client         string `json:"client"`
+	Contact        string `json:"contact"`
+	TotalPaidCents int64  `json:"total_paid_cents"`
+	PaidUntil      string `json:"paid_until"`
+	Remind         bool   `json:"remind"`
+	LastReminder   string `json:"last_reminder"`
 }
 type Payment struct {
 	ID          int64  `json:"id"`
@@ -23,15 +24,48 @@ type Payment struct {
 	AmountCents int64  `json:"amount_cents"`
 	Note        string `json:"note"`
 	CreatedAt   int64  `json:"created_at"`
-	DebtBefore  int64  `json:"debt_before"`
-	DebtAfter   int64  `json:"debt_after"`
 	PaidUntil   string `json:"paid_until"`
 }
 
 func (a *App) initFinance() error {
-	_, err := a.db.Exec(`CREATE TABLE IF NOT EXISTS rentals(route_id INTEGER PRIMARY KEY, client TEXT NOT NULL DEFAULT '', contact TEXT NOT NULL DEFAULT '', debt_cents INTEGER NOT NULL DEFAULT 0, paid_until TEXT NOT NULL DEFAULT '', remind INTEGER NOT NULL DEFAULT 0, last_reminder TEXT NOT NULL DEFAULT '');
- CREATE TABLE IF NOT EXISTS payments(id INTEGER PRIMARY KEY, route_id INTEGER NOT NULL, amount_cents INTEGER NOT NULL, note TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, debt_before INTEGER NOT NULL, debt_after INTEGER NOT NULL, paid_until TEXT NOT NULL DEFAULT '');`)
-	return err
+	_, err := a.db.Exec(`CREATE TABLE IF NOT EXISTS rentals(route_id INTEGER PRIMARY KEY, client TEXT NOT NULL DEFAULT '', contact TEXT NOT NULL DEFAULT '', paid_until TEXT NOT NULL DEFAULT '', remind INTEGER NOT NULL DEFAULT 0, last_reminder TEXT NOT NULL DEFAULT '');
+ CREATE TABLE IF NOT EXISTS payments(id INTEGER PRIMARY KEY, route_id INTEGER NOT NULL, amount_cents INTEGER NOT NULL, note TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, paid_until TEXT NOT NULL DEFAULT '');`)
+	if err != nil {
+		return err
+	}
+	rows, err := a.db.Query("PRAGMA table_info(rentals)")
+	if err != nil {
+		return err
+	}
+	legacy := false
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, typ string
+		var def sql.NullString
+		if rows.Scan(&cid, &name, &typ, &notnull, &def, &pk) == nil && name == "debt_cents" {
+			legacy = true
+		}
+	}
+	rows.Close()
+	if !legacy {
+		return nil
+	}
+	tx, err := a.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	_, err = tx.Exec(`
+ CREATE TABLE rentals_new(route_id INTEGER PRIMARY KEY, client TEXT NOT NULL DEFAULT '', contact TEXT NOT NULL DEFAULT '', paid_until TEXT NOT NULL DEFAULT '', remind INTEGER NOT NULL DEFAULT 0, last_reminder TEXT NOT NULL DEFAULT '');
+ INSERT INTO rentals_new SELECT route_id,client,contact,paid_until,remind,last_reminder FROM rentals;
+ DROP TABLE rentals; ALTER TABLE rentals_new RENAME TO rentals;
+ CREATE TABLE payments_new(id INTEGER PRIMARY KEY, route_id INTEGER NOT NULL, amount_cents INTEGER NOT NULL, note TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, paid_until TEXT NOT NULL DEFAULT '');
+ INSERT INTO payments_new SELECT id,route_id,amount_cents,note,created_at,paid_until FROM payments;
+ DROP TABLE payments; ALTER TABLE payments_new RENAME TO payments;`)
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 func validDate(v string) bool {
 	if v == "" {
@@ -43,8 +77,9 @@ func validDate(v string) bool {
 func (a *App) rental(id int64) Rental {
 	v := Rental{RouteID: id}
 	var remind int
-	_ = a.db.QueryRow("SELECT client,contact,debt_cents,paid_until,remind,last_reminder FROM rentals WHERE route_id=?", id).Scan(&v.Client, &v.Contact, &v.DebtCents, &v.PaidUntil, &remind, &v.LastReminder)
+	_ = a.db.QueryRow("SELECT client,contact,paid_until,remind,last_reminder FROM rentals WHERE route_id=?", id).Scan(&v.Client, &v.Contact, &v.PaidUntil, &remind, &v.LastReminder)
 	v.Remind = remind != 0
+	_ = a.db.QueryRow("SELECT COALESCE(SUM(amount_cents),0) FROM payments WHERE route_id=?", id).Scan(&v.TotalPaidCents)
 	return v
 }
 func (a *App) financeAPI(w http.ResponseWriter, r *http.Request) {
@@ -89,7 +124,7 @@ func (a *App) financeAPI(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(parts) == 2 && parts[1] == "payments" {
 		if r.Method == "GET" {
-			rows, e := a.db.Query("SELECT id,route_id,amount_cents,note,created_at,debt_before,debt_after,paid_until FROM payments WHERE route_id=? ORDER BY id DESC LIMIT 500", id)
+			rows, e := a.db.Query("SELECT id,route_id,amount_cents,note,created_at,paid_until FROM payments WHERE route_id=? ORDER BY id DESC LIMIT 500", id)
 			if e != nil {
 				fail(w, 500, e.Error())
 				return
@@ -98,7 +133,7 @@ func (a *App) financeAPI(w http.ResponseWriter, r *http.Request) {
 			out := []Payment{}
 			for rows.Next() {
 				var p Payment
-				if rows.Scan(&p.ID, &p.RouteID, &p.AmountCents, &p.Note, &p.CreatedAt, &p.DebtBefore, &p.DebtAfter, &p.PaidUntil) == nil {
+				if rows.Scan(&p.ID, &p.RouteID, &p.AmountCents, &p.Note, &p.CreatedAt, &p.PaidUntil) == nil {
 					out = append(out, p)
 				}
 			}
@@ -113,34 +148,27 @@ func (a *App) financeAPI(w http.ResponseWriter, r *http.Request) {
 			AmountCents int64  `json:"amount_cents"`
 			Note        string `json:"note"`
 			PaidUntil   string `json:"paid_until"`
-			DebtAfter   *int64 `json:"debt_after"`
 		}
-		if readJSON(r, &req) != nil || req.AmountCents <= 0 || req.AmountCents > 1000000000 || len(req.Note) > 300 || !validDate(req.PaidUntil) || (req.DebtAfter != nil && (*req.DebtAfter < 0 || *req.DebtAfter > 1000000000)) {
+		if readJSON(r, &req) != nil || req.AmountCents <= 0 || req.AmountCents > 1000000000 || len(req.Note) > 300 || !validDate(req.PaidUntil) || req.PaidUntil == "" {
 			fail(w, 400, "invalid payment")
 			return
 		}
 		a.financeMu.Lock()
 		defer a.financeMu.Unlock()
 		before := a.rental(id)
-		after := before.DebtCents - req.AmountCents
-		if after < 0 {
-			after = 0
-		}
-		if req.DebtAfter != nil {
-			after = *req.DebtAfter
-		}
-		date := before.PaidUntil
-		if req.PaidUntil != "" {
-			date = req.PaidUntil
+		date := req.PaidUntil
+		lastReminder := before.LastReminder
+		if date != before.PaidUntil {
+			lastReminder = ""
 		}
 		tx, e := a.db.Begin()
 		if e != nil {
 			fail(w, 500, e.Error())
 			return
 		}
-		_, e = tx.Exec("INSERT INTO rentals(route_id,client,contact,debt_cents,paid_until,remind,last_reminder) VALUES(?,?,?,?,?,?,?) ON CONFLICT(route_id) DO UPDATE SET debt_cents=excluded.debt_cents,paid_until=excluded.paid_until", id, before.Client, before.Contact, after, date, boolInt(before.Remind), before.LastReminder)
+		_, e = tx.Exec("INSERT INTO rentals(route_id,client,contact,paid_until,remind,last_reminder) VALUES(?,?,?,?,?,?) ON CONFLICT(route_id) DO UPDATE SET paid_until=excluded.paid_until,last_reminder=excluded.last_reminder", id, before.Client, before.Contact, date, boolInt(before.Remind), lastReminder)
 		if e == nil {
-			_, e = tx.Exec("INSERT INTO payments(route_id,amount_cents,note,created_at,debt_before,debt_after,paid_until) VALUES(?,?,?,?,?,?,?)", id, req.AmountCents, req.Note, time.Now().Unix(), before.DebtCents, after, date)
+			_, e = tx.Exec("INSERT INTO payments(route_id,amount_cents,note,created_at,paid_until) VALUES(?,?,?,?,?)", id, req.AmountCents, req.Note, time.Now().Unix(), date)
 		}
 		if e != nil {
 			tx.Rollback()
@@ -167,7 +195,7 @@ func (a *App) financeAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var v Rental
-	if readJSON(r, &v) != nil || len(v.Client) > 120 || len(v.Contact) > 500 || v.DebtCents < 0 || v.DebtCents > 1000000000 || !validDate(v.PaidUntil) {
+	if readJSON(r, &v) != nil || len(v.Client) > 120 || len(v.Contact) > 500 || !validDate(v.PaidUntil) {
 		fail(w, 400, "invalid rental")
 		return
 	}
@@ -175,7 +203,12 @@ func (a *App) financeAPI(w http.ResponseWriter, r *http.Request) {
 	a.financeMu.Lock()
 	defer a.financeMu.Unlock()
 	before := a.rental(id)
-	_, e = a.db.Exec("INSERT INTO rentals(route_id,client,contact,debt_cents,paid_until,remind,last_reminder) VALUES(?,?,?,?,?,?,?) ON CONFLICT(route_id) DO UPDATE SET client=excluded.client,contact=excluded.contact,debt_cents=excluded.debt_cents,paid_until=excluded.paid_until,remind=excluded.remind,last_reminder=excluded.last_reminder", id, strings.TrimSpace(v.Client), strings.TrimSpace(v.Contact), v.DebtCents, v.PaidUntil, boolInt(v.Remind), before.LastReminder)
+	_, e = a.db.Exec("INSERT INTO rentals(route_id,client,contact,paid_until,remind,last_reminder) VALUES(?,?,?,?,?,?) ON CONFLICT(route_id) DO UPDATE SET client=excluded.client,contact=excluded.contact,paid_until=excluded.paid_until,remind=excluded.remind,last_reminder=excluded.last_reminder", id, strings.TrimSpace(v.Client), strings.TrimSpace(v.Contact), v.PaidUntil, boolInt(v.Remind), func() string {
+		if v.PaidUntil != before.PaidUntil {
+			return ""
+		}
+		return before.LastReminder
+	}())
 	if e != nil {
 		fail(w, 500, e.Error())
 		return
@@ -188,7 +221,7 @@ func (a *App) checkRentals(now time.Time) {
 	if local.Hour() < 9 {
 		return
 	}
-	rows, e := a.db.Query("SELECT route_id FROM rentals WHERE remind=1 AND debt_cents>0 AND paid_until=? AND last_reminder<>?", today, today)
+	rows, e := a.db.Query("SELECT route_id FROM rentals WHERE remind=1 AND paid_until=? AND last_reminder<>?", today, today)
 	if e != nil {
 		return
 	}
@@ -223,6 +256,6 @@ func (a *App) checkRentals(now time.Time) {
 		if name == "" {
 			name = "Клиент не указан"
 		}
-		go a.notify(route, fmt.Sprintf("Напоминание об аренде: %s, контакт: %s. Оплачено до %s. Текущий долг: $%.2f.", name, v.Contact, v.PaidUntil, float64(v.DebtCents)/100))
+		go a.notify(route, fmt.Sprintf("Срок аренды заканчивается сегодня, %s. Арендатор: %s. Контакт: %s. Получено за всё время: $%.2f. Пора согласовать продление и следующую оплату.", v.PaidUntil, name, v.Contact, float64(v.TotalPaidCents)/100))
 	}
 }
