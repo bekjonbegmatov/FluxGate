@@ -97,6 +97,7 @@ type App struct {
 	liveStats                     map[int64]RequestStats
 	lastStatsAt                   time.Time
 	financeMu                     sync.Mutex
+	restoreMu                     sync.Mutex
 	start                         time.Time
 }
 type TelegramSettings struct{ APIURL, BotToken, ChatID string }
@@ -114,6 +115,8 @@ func fatal(err error) {
 }
 func main() {
 	data := env("PANEL_DATA", "./data")
+	fatal(os.MkdirAll(data, 0700))
+	fatal(applyPendingRestore(data))
 	fatal(os.MkdirAll(filepath.Join(data, "certs"), 0700))
 	db, err := sql.Open("sqlite", filepath.Join(data, "panel.db"))
 	fatal(err)
@@ -130,7 +133,11 @@ func main() {
 	if len(token) < 24 || len(master) < 24 {
 		log.Fatal("PANEL_TOKEN and PANEL_MASTER_KEY must each have at least 24 characters")
 	}
-	loc, err := time.LoadLocation(env("PANEL_TIMEZONE", "UTC"))
+	var timezone string
+	if db.QueryRow("SELECT value FROM settings WHERE key='timezone'").Scan(&timezone) != nil {
+		timezone = env("PANEL_TIMEZONE", "UTC")
+	}
+	loc, err := time.LoadLocation(timezone)
 	fatal(err)
 	a := &App{db: db, data: data, web: env("PANEL_WEB", "./web/dist"), secretPath: strings.Trim(env("PANEL_SECRET_PATH", "admin"), "/"), domain: strings.ToLower(env("PANEL_DOMAIN", "proxy.local.invalid")), tokenHash: sha256.Sum256([]byte(token)), master: []byte(master), location: loc, routes: map[int64]*RouteState{}, start: time.Now()}
 	a.domain = a.getSetting("domain", a.domain)

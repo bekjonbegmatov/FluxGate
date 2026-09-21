@@ -103,6 +103,8 @@ func (a *App) serveAdmin() {
 	mux.HandleFunc(base+"api/routes", a.auth(a.routesAPI))
 	mux.HandleFunc(base+"api/routes/", a.auth(a.routeAPI))
 	mux.HandleFunc(base+"api/settings", a.auth(a.settingsAPI))
+	mux.HandleFunc(base+"api/backup", a.auth(a.backupAPI))
+	mux.HandleFunc(base+"api/restore", a.auth(a.restoreAPI))
 	mux.HandleFunc(base+"api/history/", a.auth(a.historyAPI))
 	mux.HandleFunc(base+"api/finance", a.auth(a.financeAPI))
 	mux.HandleFunc(base+"api/finance/", a.auth(a.financeAPI))
