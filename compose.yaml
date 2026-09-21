@@ -1,0 +1,27 @@
+services:
+  haproxy:
+    build: ./haproxy
+    restart: unless-stopped
+    ports:
+      - "443:443/tcp"
+      - "9389:9389/tcp"
+    volumes:
+      - panel-data:/data
+  panel:
+    build: .
+    restart: unless-stopped
+    network_mode: "service:haproxy"
+    depends_on:
+      - haproxy
+    environment:
+      PANEL_DATA: /data
+      PANEL_WEB: /opt/panel/web
+      PANEL_SECRET_PATH: ${PANEL_SECRET_PATH:-secretpath}
+      PANEL_TOKEN: ${PANEL_TOKEN:?Set PANEL_TOKEN in .env}
+      PANEL_MASTER_KEY: ${PANEL_MASTER_KEY:?Set PANEL_MASTER_KEY in .env}
+      PANEL_TIMEZONE: ${PANEL_TIMEZONE:-UTC}
+      PANEL_DOMAIN: ${PANEL_DOMAIN:?Set PANEL_DOMAIN in .env}
+    volumes:
+      - panel-data:/data
+volumes:
+  panel-data:

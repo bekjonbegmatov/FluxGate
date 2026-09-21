@@ -1,0 +1,6 @@
+.env
+data/*
+!data/.gitkeep
+web/node_modules/
+web/dist/
+panel
