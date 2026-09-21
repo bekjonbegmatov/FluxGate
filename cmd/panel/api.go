@@ -107,6 +107,10 @@ func (a *App) serveAdmin() {
 	mux.HandleFunc(base+"api/finance", a.auth(a.financeAPI))
 	mux.HandleFunc(base+"api/finance/", a.auth(a.financeAPI))
 	mux.HandleFunc(base+"api/system", a.auth(a.systemAPI))
+	mux.HandleFunc(base+"api/request-stats", a.auth(a.requestStatsAPI))
+	mux.HandleFunc(base+"api/request-history/", a.auth(a.requestHistoryAPI))
+	mux.HandleFunc(base+"api/export/payments.csv", a.auth(a.exportPaymentsAPI))
+	mux.HandleFunc(base+"api/export/traffic.csv", a.auth(a.exportTrafficAPI))
 	mux.HandleFunc(base, func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "/api/") {
 			http.NotFound(w, r)
@@ -127,7 +131,7 @@ func (a *App) serveAdmin() {
 		w.Header().Set("Cache-Control", "no-store")
 		http.ServeFile(w, r, full)
 	})
-	listen := env("PANEL_LISTEN", "127.0.0.1:9389")
+	listen := env("PANEL_LISTEN", "0.0.0.0:9389")
 	server := &http.Server{Addr: listen, Handler: mux, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second}
 	log.Printf("panel listening on http://%s/%s/", listen, a.secretPath)
 	log.Fatal(server.ListenAndServe())
@@ -374,6 +378,8 @@ func (a *App) routeAPI(w http.ResponseWriter, r *http.Request) {
 		_, _ = a.db.Exec("DELETE FROM routes WHERE id=?", id)
 		_, _ = a.db.Exec("DELETE FROM periods WHERE route_id=?", id)
 		_, _ = a.db.Exec("DELETE FROM samples WHERE route_id=?", id)
+		_, _ = a.db.Exec("DELETE FROM request_totals WHERE route_id=?", id)
+		_, _ = a.db.Exec("DELETE FROM request_samples WHERE route_id=?", id)
 		_, _ = a.db.Exec("DELETE FROM rentals WHERE route_id=?", id)
 		_, _ = a.db.Exec("DELETE FROM payments WHERE route_id=?", id)
 		files, _ := filepath.Glob(filepath.Join(a.data, "certs", fmt.Sprintf("route_%d_*.pem", id)))
@@ -454,6 +460,7 @@ func (a *App) settingsAPI(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, v)
 	case "PUT":
 		var v struct {
+			Domain       string `json:"domain"`
 			FallbackHTML string `json:"fallback_html"`
 			TGAPI        string `json:"tg_api"`
 			TGChat       string `json:"tg_chat"`
@@ -467,10 +474,64 @@ func (a *App) settingsAPI(w http.ResponseWriter, r *http.Request) {
 			fail(w, 400, "HTML too large")
 			return
 		}
+		v.Domain = strings.ToLower(strings.TrimSpace(v.Domain))
+		if v.Domain != "" && !validDomain(v.Domain) {
+			fail(w, 400, "invalid domain")
+			return
+		}
 		u, e := url.Parse(v.TGAPI)
 		if e != nil || u.Scheme != "https" || u.Host == "" {
 			fail(w, 400, "Bot API URL must use HTTPS")
 			return
+		}
+		a.mu.RLock()
+		oldDomain := a.domain
+		a.mu.RUnlock()
+		if v.Domain == "" {
+			v.Domain = oldDomain
+		}
+		if v.Domain != oldDomain {
+			a.mu.RLock()
+			conflict := false
+			for _, route := range a.routes {
+				route.mu.Lock()
+				sni := route.Route.SNI
+				route.mu.Unlock()
+				if sni == v.Domain || (strings.HasPrefix(sni, "*.") && strings.HasSuffix(v.Domain, sni[1:])) {
+					conflict = true
+					break
+				}
+			}
+			a.mu.RUnlock()
+			if conflict {
+				fail(w, 409, "domain is already used by a server route")
+				return
+			}
+			certPath := filepath.Join(a.data, "certs", "fallback.pem")
+			oldCert, err := os.ReadFile(certPath)
+			if err != nil {
+				fail(w, 500, err.Error())
+				return
+			}
+			if err = a.ensureCert("fallback", v.Domain); err != nil {
+				fail(w, 500, err.Error())
+				return
+			}
+			a.mu.Lock()
+			a.domain = v.Domain
+			a.mu.Unlock()
+			if err = a.writeConfig(); err == nil {
+				err = a.setSetting("domain", v.Domain)
+			}
+			if err != nil {
+				a.mu.Lock()
+				a.domain = oldDomain
+				a.mu.Unlock()
+				_ = os.WriteFile(certPath, oldCert, 0600)
+				_ = a.writeConfig()
+				fail(w, 500, err.Error())
+				return
+			}
 		}
 		a.mu.Lock()
 		a.fallback = v.FallbackHTML

@@ -92,6 +92,10 @@ type App struct {
 	fallback                      string
 	tg                            TelegramSettings
 	configMu                      sync.Mutex
+	statsMu                       sync.RWMutex
+	lastStats                     map[int64]requestCounter
+	liveStats                     map[int64]RequestStats
+	lastStatsAt                   time.Time
 	financeMu                     sync.Mutex
 	start                         time.Time
 }
@@ -129,6 +133,7 @@ func main() {
 	loc, err := time.LoadLocation(env("PANEL_TIMEZONE", "UTC"))
 	fatal(err)
 	a := &App{db: db, data: data, web: env("PANEL_WEB", "./web/dist"), secretPath: strings.Trim(env("PANEL_SECRET_PATH", "admin"), "/"), domain: strings.ToLower(env("PANEL_DOMAIN", "proxy.local.invalid")), tokenHash: sha256.Sum256([]byte(token)), master: []byte(master), location: loc, routes: map[int64]*RouteState{}, start: time.Now()}
+	a.domain = a.getSetting("domain", a.domain)
 	if !validDomain(a.domain) {
 		log.Fatal("invalid PANEL_DOMAIN")
 	}
@@ -138,6 +143,8 @@ func main() {
 	a.fallback = a.getSetting("fallback_html", `<!doctype html><html><head><meta charset="utf-8"><title>Welcome</title></head><body><h1>Welcome</h1></body></html>`)
 	a.tg = TelegramSettings{APIURL: a.getSetting("tg_api", "https://api.telegram.org"), BotToken: a.decrypt(a.getSetting("tg_token", "")), ChatID: a.getSetting("tg_chat", "")}
 	fatal(a.initFinance())
+	fatal(a.initRequestStats())
+	a.liveStats = map[int64]RequestStats{}
 	fatal(a.ensureCert("fallback", a.domain))
 	fatal(a.loadRoutes())
 	fatal(a.writeConfig())

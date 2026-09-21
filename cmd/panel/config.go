@@ -26,6 +26,7 @@ func (a *App) writeConfig() error {
 	a.configMu.Lock()
 	defer a.configMu.Unlock()
 	a.mu.RLock()
+	domain := a.domain
 	routes := make([]*RouteState, 0, len(a.routes))
 	for _, s := range a.routes {
 		routes = append(routes, s)
@@ -40,10 +41,14 @@ func (a *App) writeConfig() error {
 		return len(routes[i].Route.SNI) > len(routes[j].Route.SNI)
 	})
 	var b bytes.Buffer
-	fmt.Fprintln(&b, "global\n  maxconn 20000\n  stats socket "+filepath.Join(a.data, "haproxy.sock")+" mode 660 level admin\n  tune.ssl.default-dh-param 2048")
+	socketGroup := ""
+	if a.data != "/data" {
+		socketGroup = " group fluxgate"
+	}
+	fmt.Fprintln(&b, "global\n  maxconn 20000\n  stats socket "+filepath.Join(a.data, "haproxy.sock")+" mode 660"+socketGroup+" level admin\n  tune.ssl.default-dh-param 2048")
 	fmt.Fprintln(&b, "defaults\n  mode http\n  timeout connect 10s\n  timeout client 1h\n  timeout server 1h\n  timeout tunnel 1h")
 	fmt.Fprintln(&b, "frontend public_sni\n  mode tcp\n  bind :443\n  tcp-request inspect-delay 5s\n  tcp-request content accept if { req.ssl_hello_type 1 }")
-	fmt.Fprintf(&b, "  acl primary req.ssl_sni -i %s\n  use_backend relay_fallback if primary\n", a.domain)
+	fmt.Fprintf(&b, "  acl primary req.ssl_sni -i %s\n  use_backend relay_fallback if primary\n", domain)
 	for _, s := range routes {
 		r := s.Route
 		fmt.Fprintf(&b, "  acl sni_%d req.ssl_sni %s\n", r.ID, aclPattern(r.SNI))
@@ -61,7 +66,7 @@ func (a *App) writeConfig() error {
 		fmt.Fprintf(&b, " crt %s", filepath.Join(a.data, "certs", routeCert(s.Route)+".pem"))
 	}
 	fmt.Fprintln(&b, " alpn http/1.1\n  http-request set-header X-Forwarded-Proto https")
-	fmt.Fprintf(&b, "  acl primary ssl_fc_sni -i %s\n  use_backend fallback_page if primary\n", a.domain)
+	fmt.Fprintf(&b, "  acl primary ssl_fc_sni -i %s\n  use_backend fallback_page if primary\n", domain)
 	for _, s := range routes {
 		r := s.Route
 		fmt.Fprintf(&b, "  acl host_%d ssl_fc_sni %s\n", r.ID, aclPattern(r.SNI))

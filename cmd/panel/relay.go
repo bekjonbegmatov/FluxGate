@@ -276,6 +276,9 @@ func (a *App) tick() {
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
 	for now := range t.C {
+		if now.Unix()%10 == 0 {
+			go a.collectRequestStats(now)
+		}
 		if now.Second() == 0 {
 			go a.checkRentals(now)
 		}
@@ -347,6 +350,7 @@ func (a *App) tick() {
 		}
 		if now.Minute() == 0 && now.Second() == 0 {
 			_, _ = a.db.Exec("DELETE FROM samples WHERE ts<?", now.AddDate(0, 0, -90).Unix())
+			_, _ = a.db.Exec("DELETE FROM request_samples WHERE ts<?", now.AddDate(0, 0, -90).Unix())
 		}
 	}
 }
