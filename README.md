@@ -8,7 +8,7 @@
 
 Панель слушает **только** `http://127.0.0.1:9389/admin/` без HTTPS. Для доступа со своего компьютера создайте туннель `ssh -L 9389:127.0.0.1:9389 user@server` и откройте тот же адрес в браузере. Токен для входа смотрите командой `sudo sed -n 's/^PANEL_TOKEN=//p' /etc/fluxgate/fluxgate.env`.
 
-Перед публичным использованием замените `PANEL_DOMAIN=proxy.local.invalid` на свой основной домен и при необходимости `PANEL_TIMEZONE=UTC` в `/etc/fluxgate/fluxgate.env`, затем выполните `sudo systemctl restart fluxgate-panel`. Направьте основной домен и SNI-имена серверов на VPS. Для `*.api.example.com` нужна wildcard-запись DNS.
+Основной домен этого развёртывания — `cubeland.top`. При необходимости измените `PANEL_TIMEZONE=UTC` в `/etc/fluxgate/fluxgate.env`, затем выполните `sudo systemctl restart fluxgate-panel`. Направьте основной домен и SNI-имена серверов на VPS. Для `*.api.example.com` нужна wildcard-запись DNS.
 
 ## Запуск через Docker Compose
 
