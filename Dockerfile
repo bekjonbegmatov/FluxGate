@@ -12,8 +12,9 @@ RUN npm ci
 COPY web/ ./
 RUN npm run build
 
-FROM alpine:3.21
-RUN apk add --no-cache ca-certificates haproxy
+FROM haproxy:3.2-alpine
+USER root
+RUN apk add --no-cache ca-certificates
 COPY --from=go-build /panel /usr/local/bin/panel
 COPY --from=web-build /src/web/dist /opt/panel/web
 ENV PANEL_DATA=/data PANEL_WEB=/opt/panel/web

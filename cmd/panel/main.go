@@ -13,9 +13,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/pem"
-	"errors"
 	"fmt"
-	"html"
 	"io"
 	"log"
 	"math/big"
@@ -25,8 +23,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -130,6 +126,9 @@ func main() {
 	a := &App{db: db, data: data, web: env("PANEL_WEB", "./web/dist"), secretPath: strings.Trim(env("PANEL_SECRET_PATH", "secretpath"), "/"), domain: strings.ToLower(env("PANEL_DOMAIN", "site.example.com")), tokenHash: sha256.Sum256([]byte(token)), master: []byte(master), location: loc, routes: map[int64]*RouteState{}, start: time.Now()}
 	if !validDomain(a.domain) {
 		log.Fatal("invalid PANEL_DOMAIN")
+	}
+	if !regexp.MustCompile(`^[A-Za-z0-9_-]{8,64}$`).MatchString(a.secretPath) {
+		log.Fatal("PANEL_SECRET_PATH must be 8–64 letters, digits, underscore, or dash")
 	}
 	a.fallback = a.getSetting("fallback_html", `<!doctype html><html><head><meta charset="utf-8"><title>Welcome</title></head><body><h1>Welcome</h1></body></html>`)
 	a.tg = TelegramSettings{APIURL: a.getSetting("tg_api", "https://api.telegram.org"), BotToken: a.decrypt(a.getSetting("tg_token", "")), ChatID: a.getSetting("tg_chat", "")}
@@ -291,8 +290,16 @@ func (s *RouteState) counted(up bool) bool {
 }
 func (a *App) ensureCert(name, domain string) error {
 	path := filepath.Join(a.data, "certs", name+".pem")
-	if _, err := os.Stat(path); err == nil {
-		return nil
+	if existing, err := os.ReadFile(path); err == nil {
+		if block, _ := pem.Decode(existing); block != nil {
+			if cert, err := x509.ParseCertificate(block.Bytes); err == nil && time.Now().Before(cert.NotAfter) {
+				for _, san := range cert.DNSNames {
+					if san == domain {
+						return nil
+					}
+				}
+			}
+		}
 	}
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -316,7 +323,11 @@ func (a *App) ensureCert(name, domain string) error {
 		return err
 	}
 	out := append(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: pk})...)
-	return os.WriteFile(path, out, 0600)
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, out, 0600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 func (a *App) serveFallback() {
@@ -342,24 +353,24 @@ func (a *App) notify(r Route, msg string) {
 	}
 	go func() {
 		body := url.Values{"chat_id": {tg.ChatID}, "text": {fmt.Sprintf("%s (%s): %s", r.Name, r.SNI, msg)}}
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		req, _ := http.NewRequestWithContext(ctx, "POST", strings.TrimRight(tg.APIURL, "/")+"/bot"+tg.BotToken+"/sendMessage", strings.NewReader(body.Encode()))
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			log.Printf("telegram: %v", err)
-			return
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode >= 300 {
-			log.Printf("telegram: %s", resp.Status)
+		for attempt := 0; attempt < 3; attempt++ {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			req, _ := http.NewRequestWithContext(ctx, "POST", strings.TrimRight(tg.APIURL, "/")+"/bot"+tg.BotToken+"/sendMessage", strings.NewReader(body.Encode()))
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			resp, err := http.DefaultClient.Do(req)
+			if resp != nil {
+				_ = resp.Body.Close()
+			}
+			cancel()
+			if err == nil && resp.StatusCode < 300 {
+				return
+			}
+			if err != nil {
+				log.Printf("telegram: %v", err)
+			} else {
+				log.Printf("telegram: %s", resp.Status)
+			}
+			time.Sleep(time.Duration(attempt+1) * time.Second)
 		}
 	}()
 }
-
-var _ = errors.New
-var _ = html.EscapeString
-var _ = sort.Slice
-var _ = strconv.Itoa
-var _ = sync.Mutex{}

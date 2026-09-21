@@ -8,7 +8,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
@@ -307,6 +306,11 @@ func (a *App) routeAPI(w http.ResponseWriter, r *http.Request) {
 			fail(w, 400, "main domain is reserved for fallback")
 			return
 		}
+		var conflict int64
+		if a.db.QueryRow("SELECT id FROM routes WHERE sni=? AND id<>?", v.SNI, id).Scan(&conflict) == nil {
+			fail(w, 409, "SNI is already assigned")
+			return
+		}
 		s.mu.Lock()
 		s.Route = v
 		s.mu.Unlock()
@@ -322,6 +326,10 @@ func (a *App) routeAPI(w http.ResponseWriter, r *http.Request) {
 		}
 		_, e = a.db.Exec("UPDATE routes SET name=?,sni=?,ip=?,port=?,tls=?,verify=?,verify_name=?,paused=?,daily_limit=?,monthly_limit=?,count_mode=?,down_bps=?,up_bps=?,threshold=? WHERE id=?", v.Name, v.SNI, v.IP, v.Port, boolInt(v.TLS), boolInt(v.Verify), v.VerifyName, boolInt(v.Paused), v.DailyLimit, v.MonthlyLimit, v.CountMode, v.DownBPS, v.UpBPS, v.Threshold, id)
 		if e != nil {
+			s.mu.Lock()
+			s.Route = old
+			s.mu.Unlock()
+			_ = a.writeConfig()
 			fail(w, 500, e.Error())
 			return
 		}
@@ -482,5 +490,3 @@ func (a *App) historyAPI(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, out)
 }
-
-var _ = io.Copy
