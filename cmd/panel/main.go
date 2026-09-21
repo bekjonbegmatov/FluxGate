@@ -56,6 +56,7 @@ type Route struct {
 	MonthlyExtra int64  `json:"monthly_extra"`
 	UpRate       int64  `json:"up_rate"`
 	DownRate     int64  `json:"down_rate"`
+	Monitor      bool   `json:"monitor"`
 }
 
 type Period struct {
@@ -73,6 +74,8 @@ type RouteState struct {
 	pendingUp, pendingDown int64
 	lastUp, lastDown       int64
 	healthy                bool
+	unhealthySince         time.Time
+	alertSent              bool
 }
 type bucket struct {
 	tokens float64
@@ -89,6 +92,7 @@ type App struct {
 	fallback                      string
 	tg                            TelegramSettings
 	configMu                      sync.Mutex
+	financeMu                     sync.Mutex
 	start                         time.Time
 }
 type TelegramSettings struct{ APIURL, BotToken, ChatID string }
@@ -116,6 +120,7 @@ func main() {
  CREATE TABLE IF NOT EXISTS samples(route_id INTEGER NOT NULL, ts INTEGER NOT NULL, up INTEGER NOT NULL, down INTEGER NOT NULL, PRIMARY KEY(route_id,ts));
  CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);`)
 	fatal(err)
+	fatal(migrateRouteMonitor(db))
 	token := os.Getenv("PANEL_TOKEN")
 	master := os.Getenv("PANEL_MASTER_KEY")
 	if len(token) < 24 || len(master) < 24 {
@@ -132,6 +137,7 @@ func main() {
 	}
 	a.fallback = a.getSetting("fallback_html", `<!doctype html><html><head><meta charset="utf-8"><title>Welcome</title></head><body><h1>Welcome</h1></body></html>`)
 	a.tg = TelegramSettings{APIURL: a.getSetting("tg_api", "https://api.telegram.org"), BotToken: a.decrypt(a.getSetting("tg_token", "")), ChatID: a.getSetting("tg_chat", "")}
+	fatal(a.initFinance())
 	fatal(a.ensureCert("fallback", a.domain))
 	fatal(a.loadRoutes())
 	fatal(a.writeConfig())
@@ -198,16 +204,37 @@ func boolInt(v bool) int {
 	}
 	return 0
 }
+func migrateRouteMonitor(db *sql.DB) error {
+	rows, err := db.Query("PRAGMA table_info(routes)")
+	if err != nil {
+		return err
+	}
+	found := false
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, kind string
+		var def sql.NullString
+		if rows.Scan(&cid, &name, &kind, &notnull, &def, &pk) == nil && name == "monitor" {
+			found = true
+		}
+	}
+	rows.Close()
+	if found {
+		return nil
+	}
+	_, err = db.Exec("ALTER TABLE routes ADD COLUMN monitor INTEGER NOT NULL DEFAULT 0")
+	return err
+}
 func (a *App) loadRoutes() error {
-	rows, err := a.db.Query("SELECT id,name,sni,ip,port,tls,verify,verify_name,paused,daily_limit,monthly_limit,count_mode,down_bps,up_bps,threshold,created_at,up_total,down_total FROM routes")
+	rows, err := a.db.Query("SELECT id,name,sni,ip,port,tls,verify,verify_name,paused,daily_limit,monthly_limit,count_mode,down_bps,up_bps,threshold,created_at,up_total,down_total,monitor FROM routes")
 	if err != nil {
 		return err
 	}
 	loaded := []*RouteState{}
 	for rows.Next() {
 		var r Route
-		var t, v, p int
-		err = rows.Scan(&r.ID, &r.Name, &r.SNI, &r.IP, &r.Port, &t, &v, &r.VerifyName, &p, &r.DailyLimit, &r.MonthlyLimit, &r.CountMode, &r.DownBPS, &r.UpBPS, &r.Threshold, &r.CreatedAt, &r.UpTotal, &r.DownTotal)
+		var t, v, p, monitor int
+		err = rows.Scan(&r.ID, &r.Name, &r.SNI, &r.IP, &r.Port, &t, &v, &r.VerifyName, &p, &r.DailyLimit, &r.MonthlyLimit, &r.CountMode, &r.DownBPS, &r.UpBPS, &r.Threshold, &r.CreatedAt, &r.UpTotal, &r.DownTotal, &monitor)
 		if err != nil {
 			_ = rows.Close()
 			return err
@@ -215,6 +242,7 @@ func (a *App) loadRoutes() error {
 		r.TLS = t != 0
 		r.Verify = v != 0
 		r.Paused = p != 0
+		r.Monitor = monitor != 0
 		s := &RouteState{Route: r, conns: map[net.Conn]struct{}{}}
 		loaded = append(loaded, s)
 	}

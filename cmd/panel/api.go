@@ -104,6 +104,9 @@ func (a *App) serveAdmin() {
 	mux.HandleFunc(base+"api/routes/", a.auth(a.routeAPI))
 	mux.HandleFunc(base+"api/settings", a.auth(a.settingsAPI))
 	mux.HandleFunc(base+"api/history/", a.auth(a.historyAPI))
+	mux.HandleFunc(base+"api/finance", a.auth(a.financeAPI))
+	mux.HandleFunc(base+"api/finance/", a.auth(a.financeAPI))
+	mux.HandleFunc(base+"api/system", a.auth(a.systemAPI))
 	mux.HandleFunc(base, func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "/api/") {
 			http.NotFound(w, r)
@@ -229,7 +232,7 @@ func (a *App) createRoute(w http.ResponseWriter, v Route) {
 	}
 	v.CreatedAt = time.Now().Unix()
 	a.mu.Lock()
-	result, e := a.db.Exec("INSERT INTO routes(name,sni,ip,port,tls,verify,verify_name,paused,daily_limit,monthly_limit,count_mode,down_bps,up_bps,threshold,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", v.Name, v.SNI, v.IP, v.Port, boolInt(v.TLS), boolInt(v.Verify), v.VerifyName, boolInt(v.Paused), v.DailyLimit, v.MonthlyLimit, v.CountMode, v.DownBPS, v.UpBPS, v.Threshold, v.CreatedAt)
+	result, e := a.db.Exec("INSERT INTO routes(name,sni,ip,port,tls,verify,verify_name,paused,daily_limit,monthly_limit,count_mode,down_bps,up_bps,threshold,created_at,monitor) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", v.Name, v.SNI, v.IP, v.Port, boolInt(v.TLS), boolInt(v.Verify), v.VerifyName, boolInt(v.Paused), v.DailyLimit, v.MonthlyLimit, v.CountMode, v.DownBPS, v.UpBPS, v.Threshold, v.CreatedAt, boolInt(v.Monitor))
 	if e != nil {
 		a.mu.Unlock()
 		fail(w, 409, e.Error())
@@ -328,7 +331,7 @@ func (a *App) routeAPI(w http.ResponseWriter, r *http.Request) {
 			fail(w, 400, e.Error())
 			return
 		}
-		_, e = a.db.Exec("UPDATE routes SET name=?,sni=?,ip=?,port=?,tls=?,verify=?,verify_name=?,paused=?,daily_limit=?,monthly_limit=?,count_mode=?,down_bps=?,up_bps=?,threshold=? WHERE id=?", v.Name, v.SNI, v.IP, v.Port, boolInt(v.TLS), boolInt(v.Verify), v.VerifyName, boolInt(v.Paused), v.DailyLimit, v.MonthlyLimit, v.CountMode, v.DownBPS, v.UpBPS, v.Threshold, id)
+		_, e = a.db.Exec("UPDATE routes SET name=?,sni=?,ip=?,port=?,tls=?,verify=?,verify_name=?,paused=?,daily_limit=?,monthly_limit=?,count_mode=?,down_bps=?,up_bps=?,threshold=?,monitor=? WHERE id=?", v.Name, v.SNI, v.IP, v.Port, boolInt(v.TLS), boolInt(v.Verify), v.VerifyName, boolInt(v.Paused), v.DailyLimit, v.MonthlyLimit, v.CountMode, v.DownBPS, v.UpBPS, v.Threshold, boolInt(v.Monitor), id)
 		if e != nil {
 			s.mu.Lock()
 			s.Route = old
@@ -371,6 +374,8 @@ func (a *App) routeAPI(w http.ResponseWriter, r *http.Request) {
 		_, _ = a.db.Exec("DELETE FROM routes WHERE id=?", id)
 		_, _ = a.db.Exec("DELETE FROM periods WHERE route_id=?", id)
 		_, _ = a.db.Exec("DELETE FROM samples WHERE route_id=?", id)
+		_, _ = a.db.Exec("DELETE FROM rentals WHERE route_id=?", id)
+		_, _ = a.db.Exec("DELETE FROM payments WHERE route_id=?", id)
 		files, _ := filepath.Glob(filepath.Join(a.data, "certs", fmt.Sprintf("route_%d_*.pem", id)))
 		for _, f := range files {
 			_ = os.Remove(f)
@@ -492,8 +497,9 @@ func (a *App) historyAPI(w http.ResponseWriter, r *http.Request) {
 		fail(w, 405, "method")
 		return
 	}
-	id, e := strconv.ParseInt(strings.TrimPrefix(r.URL.Path, "/"+a.secretPath+"/api/history/"), 10, 64)
-	if e != nil {
+	part := strings.TrimPrefix(r.URL.Path, "/"+a.secretPath+"/api/history/")
+	id, e := strconv.ParseInt(part, 10, 64)
+	if e != nil && part != "all" {
 		fail(w, 400, "id")
 		return
 	}
@@ -507,7 +513,13 @@ func (a *App) historyAPI(w http.ResponseWriter, r *http.Request) {
 	if bucket < 60 {
 		bucket = 60
 	}
-	rows, e := a.db.Query("SELECT (ts / ?) * ?, SUM(up), SUM(down) FROM samples WHERE route_id=? AND ts>=? GROUP BY 1 ORDER BY 1", bucket, bucket, id, since)
+	query := "SELECT (ts / ?) * ?, SUM(up), SUM(down) FROM samples WHERE route_id=? AND ts>=? GROUP BY 1 ORDER BY 1"
+	args := []any{bucket, bucket, id, since}
+	if part == "all" {
+		query = "SELECT (ts / ?) * ?, SUM(up), SUM(down) FROM samples WHERE ts>=? GROUP BY 1 ORDER BY 1"
+		args = []any{bucket, bucket, since}
+	}
+	rows, e := a.db.Query(query, args...)
 	if e != nil {
 		fail(w, 500, e.Error())
 		return

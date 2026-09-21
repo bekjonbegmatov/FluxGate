@@ -81,8 +81,35 @@ func (a *App) checkHealth(s *RouteState) {
 		_ = c.Close()
 	}
 	s.mu.Lock()
+	previous := s.healthy
 	s.healthy = err == nil
+	route := s.Route
+	now := time.Now()
+	alert := false
+	recovered := false
+	if err == nil {
+		recovered = s.alertSent && route.Monitor
+		s.unhealthySince = time.Time{}
+		s.alertSent = false
+	} else if route.Monitor {
+		if s.unhealthySince.IsZero() {
+			s.unhealthySince = now
+		}
+		if !s.alertSent && now.Sub(s.unhealthySince) >= 5*time.Minute {
+			s.alertSent = true
+			alert = true
+		}
+	} else {
+		s.unhealthySince = time.Time{}
+		s.alertSent = false
+	}
 	s.mu.Unlock()
+	if alert {
+		go a.notify(route, fmt.Sprintf("Конечный сервер не отвечает более 5 минут. Адрес: %s:%d. Последняя проверка: %s.", route.IP, route.Port, now.In(a.location).Format("2006-01-02 15:04:05 MST")))
+	}
+	if recovered && !previous {
+		go a.notify(route, fmt.Sprintf("Доступ к конечному серверу восстановлен: %s:%d.", route.IP, route.Port))
+	}
 }
 func (a *App) handleConn(s *RouteState, client net.Conn) {
 	upstream, err := net.DialTimeout("tcp", "127.0.0.1:8443", 5*time.Second)
@@ -249,6 +276,9 @@ func (a *App) tick() {
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
 	for now := range t.C {
+		if now.Second() == 0 {
+			go a.checkRentals(now)
+		}
 		a.mu.RLock()
 		routes := make([]*RouteState, 0, len(a.routes))
 		for _, s := range a.routes {
