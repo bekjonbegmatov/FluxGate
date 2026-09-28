@@ -1,4 +1,4 @@
-import React, {useEffect,useMemo,useState} from 'react';
+import React, {useEffect,useMemo,useRef,useState} from 'react';
 import {createRoot} from 'react-dom/client';
 import {Activity,ArrowDownLeft,ArrowUpRight,Bell,ChevronRight,CircleHelp,Cloud,Copy,ExternalLink,Gauge,Globe2,LayoutDashboard,LockKeyhole,MoreVertical,Pause,Play,Plus,RefreshCw,Search,Server,Settings,Shield,Trash2,Wifi, X, Wallet} from 'lucide-react';
 import './style.css';
@@ -11,7 +11,22 @@ type RequestPoint=[number,number,number,number,number,number];
 type Host={cpu_percent:number;load1:number;ram_total:number;ram_used:number;swap_total:number;swap_used:number;disk_total:number;disk_used:number};
 type SettingsData={domain:string;timezone:string;fallback_html:string;tg_api:string;tg_chat:string;tg_token_set:boolean};
 const base=location.pathname.split('/').filter(Boolean)[0]||'secretpath';
-async function api<T>(path:string,init?:RequestInit):Promise<T>{const res=await fetch(`/${base}/api${path}`,{credentials:'same-origin',headers:{'Content-Type':'application/json',...(init?.headers||{})},...init});const data=await res.json().catch(()=>({}));if(!res.ok)throw new Error(data.error||`HTTP ${res.status}`);return data as T}
+async function api<T>(path:string,init?:RequestInit):Promise<T>{
+ const controller=new AbortController();
+ const abort=()=>controller.abort();
+ if(init?.signal?.aborted)controller.abort();
+ init?.signal?.addEventListener('abort',abort,{once:true});
+ const timeout=setTimeout(abort,15000);
+ try{const res=await fetch(`/${base}/api${path}`,{...init,credentials:'same-origin',headers:{'Content-Type':'application/json',...(init?.headers||{})},signal:controller.signal});const data=await res.json().catch(()=>({}));if(!res.ok)throw new Error(data.error||`HTTP ${res.status}`);return data as T}
+ finally{clearTimeout(timeout);init?.signal?.removeEventListener('abort',abort)}
+}
+// Schedule after completion: slow responses cannot build an unbounded queue.
+function usePoll(run:(signal:AbortSignal)=>Promise<void>,deps:React.DependencyList,interval:number){
+ useEffect(()=>{const controller=new AbortController();let timer:ReturnType<typeof setTimeout>;
+  const tick=async()=>{try{if(!document.hidden)await run(controller.signal)}catch{}finally{if(!controller.signal.aborted)timer=setTimeout(tick,interval)}};
+  void tick();return()=>{controller.abort();clearTimeout(timer)}
+ },deps);
+}
 const bytes=(n:number)=>{if(!n)return '0 B';const u=['B','KB','MB','GB','TB'];let v=n,i=0;while(v>=1024&&i<u.length-1){v/=1024;i++}return `${v>=100?Math.round(v):v.toFixed(v>=10?1:2)} ${u[i]}`};
 const speed=(n:number)=>`${(n*8/1e6).toFixed(n?1:0)} Mbps`;
 const max=(n:number)=>n>0?bytes(n):'∞';
@@ -28,17 +43,19 @@ const usd=(c:number)=>`$${(c/100).toFixed(2)}`;
 const pathFor=(section:string,id?:number)=>`/${base}/${section}${id?'/'+id:''}`;
 function navigate(url:string){history.pushState({},'',url);window.dispatchEvent(new PopStateEvent('popstate'))}
 function App(){const [authorized,setAuth]=useState<boolean|null>(null),[token,setToken]=useState(''),[routes,setRoutes]=useState<Route[]>([]),[settings,setSettings]=useState<SettingsData|null>(null),[selected,setSelected]=useState<number|null>(null),[history,setHistory]=useState<[number,number,number][]>([]),[historyHours,setHistoryHours]=useState(24),[tab,setTab]=useState<'overview'|'servers'|'finance'|'settings'>('overview'),[editor,setEditor]=useState<Route|null>(null),[showEditor,setShowEditor]=useState(false),[message,setMessage]=useState(''),[search,setSearch]=useState(''),[topup,setTopup]=useState<'daily'|'monthly'|null>(null),[topupGB,setTopupGB]=useState(''),[rentals,setRentals]=useState<Rental[]>([]),[rental,setRental]=useState<Rental|null>(null),[payments,setPayments]=useState<Payment[]>([]),[host,setHost]=useState<Host|null>(null),[paymentAmount,setPaymentAmount]=useState(''),[paymentDate,setPaymentDate]=useState(''),[paymentNote,setPaymentNote]=useState(''),[requestStats,setRequestStats]=useState<RequestStats[]>([]),[requestHistory,setRequestHistory]=useState<RequestPoint[]>([]);
-const active=routes.find(r=>r.id===selected)||routes[0];
+const refreshVersion=useRef(0);
+const active=selected===null?routes[0]:routes.find(r=>r.id===selected);
 useEffect(()=>{const update=()=>{const p=location.pathname.split('/').filter(Boolean);setTab(p[1]==='servers'?'servers':p[1]==='finance'?'finance':p[1]==='settings'?'settings':'overview');const id=Number(p[2]);setSelected(Number.isFinite(id)&&id>0?id:null)};addEventListener('popstate',update);update();return()=>removeEventListener('popstate',update)},[]);
-useEffect(()=>{if(!active||tab!=='finance')return;api<Rental>(`/finance/${active.id}`).then(setRental).catch(()=>{});api<Payment[]>(`/finance/${active.id}/payments`).then(setPayments).catch(()=>{})},[active?.id,tab]);
+useEffect(()=>{if(!active||tab!=='finance')return;const controller=new AbortController();setRental(null);setPayments([]);Promise.all([api<Rental>(`/finance/${active.id}`,{signal:controller.signal}),api<Payment[]>(`/finance/${active.id}/payments`,{signal:controller.signal})]).then(([r,p])=>{if(!controller.signal.aborted){setRental(r);setPayments(p)}}).catch(()=>{});return()=>controller.abort()},[active?.id,tab]);
 const totalDown=routes.reduce((s,r)=>s+r.down_total,0),totalUp=routes.reduce((s,r)=>s+r.up_total,0);
 const rateDown=routes.reduce((s,r)=>s+r.down_rate,0),rateUp=routes.reduce((s,r)=>s+r.up_rate,0);
-const filtered=routes.filter(r=>`${r.name} ${r.sni} ${r.ip}`.toLowerCase().includes(search.toLowerCase()));
+const filtered=routes.filter(r=>`${r.name} ${r.sni} ${r.ip}`.toLowerCase().includes(search.toLowerCase())).sort((a,b)=>a.id-b.id);
 function flash(e:unknown){setMessage(e instanceof Error?e.message:String(e));setTimeout(()=>setMessage(''),5000)}
-async function load(){try{const [r,s]=await Promise.all([api<Route[]>('/routes'),api<SettingsData>('/settings')]);setRoutes(r);setSettings(s);setAuth(true);api<Rental[]>('/finance').then(setRentals).catch(()=>{});api<Host>('/system').then(setHost).catch(()=>{});api<RequestStats[]>('/request-stats').then(setRequestStats).catch(()=>{})}catch(e){if(String(e).includes('unauthorized'))setAuth(false);else flash(e)}}
-useEffect(()=>{load();const t=setInterval(()=>{if(authorized)Promise.all([api<Route[]>('/routes').then(setRoutes),api<Host>('/system').then(setHost),api<RequestStats[]>('/request-stats').then(setRequestStats)]).catch(()=>{})},1000);return()=>clearInterval(t)},[authorized]);
-useEffect(()=>{const run=()=>api<[number,number,number][]>(`/history/${tab==='overview'?'all':active?.id||'all'}?hours=${historyHours}`).then(setHistory).catch(()=>{});run();const t=setInterval(run,30000);return()=>clearInterval(t)},[active?.id,historyHours,tab]);
-useEffect(()=>{if(tab!=='servers'&&tab!=='overview')return;const run=()=>api<RequestPoint[]>(`/request-history/${tab==='overview'?'all':active?.id||'all'}?hours=${historyHours}`).then(setRequestHistory).catch(()=>{});run();const t=setInterval(run,30000);return()=>clearInterval(t)},[active?.id,historyHours,tab]);
+async function load(){const version=++refreshVersion.current;try{const [r,s,f]=await Promise.all([api<Route[]>('/routes'),api<SettingsData>('/settings'),api<Rental[]>('/finance')]);if(version===refreshVersion.current){setRoutes(r);setSettings(s);setRentals(f)}setAuth(true)}catch(e){if(String(e).includes('unauthorized'))setAuth(false);else flash(e)}}
+useEffect(()=>{void load()},[]);
+usePoll(async signal=>{if(!authorized)return;const version=refreshVersion.current;try{const [r,h,s]=await Promise.all([api<Route[]>('/routes',{signal}),api<Host>('/system',{signal}),api<RequestStats[]>('/request-stats',{signal})]);if(!signal.aborted&&version===refreshVersion.current){setRoutes(r);setHost(h);setRequestStats(s)}}catch(e){if(!signal.aborted&&String(e).includes('unauthorized'))setAuth(false)}},[authorized],2000);
+usePoll(async signal=>{if(!authorized||(tab!=='servers'&&tab!=='overview'))return;const h=await api<[number,number,number][]>(`/history/${tab==='overview'?'all':active?.id||'all'}?hours=${historyHours}`,{signal});if(!signal.aborted)setHistory(h)},[authorized,active?.id,historyHours,tab],30000);
+usePoll(async signal=>{if(!authorized||(tab!=='servers'&&tab!=='overview'))return;const h=await api<RequestPoint[]>(`/request-history/${tab==='overview'?'all':active?.id||'all'}?hours=${historyHours}`,{signal});if(!signal.aborted)setRequestHistory(h)},[authorized,active?.id,historyHours,tab],30000);
 async function login(e:React.FormEvent){e.preventDefault();try{await api('/login',{method:'POST',body:JSON.stringify({token})});setToken('');await load()}catch(e){flash(e)}}
 async function saveRoute(e:React.FormEvent){e.preventDefault();if(!editor)return;try{const payload={...editor,port:Number(editor.port),daily_limit:Number(editor.daily_limit),monthly_limit:Number(editor.monthly_limit),down_bps:Number(editor.down_bps),up_bps:Number(editor.up_bps),threshold:Number(editor.threshold)};const result=await api<Route>(editor.id?`/routes/${editor.id}`:'/routes',{method:editor.id?'PUT':'POST',body:JSON.stringify(payload)});setShowEditor(false);navigate(pathFor('servers',result.id));await load()}catch(e){flash(e)}}
 async function toggle(r:Route){try{await api(`/routes/${r.id}`,{method:'PUT',body:JSON.stringify({...r,paused:!r.paused})});await load()}catch(e){flash(e)}}

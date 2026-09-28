@@ -1,247 +1,357 @@
 package main
 
 import (
+	"bufio"
+	"context"
+	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"net/http"
+	"path/filepath"
 	"sync"
 	"time"
 )
 
+const relayBufferSize = 64 * 1024
+const relayIdleTimeout = time.Hour
+
+var relayBuffers = sync.Pool{New: func() any { b := make([]byte, relayBufferSize); return &b }}
+
+// Closing either side interrupts writes and rate-limit waits on the other.
+type relayConn struct {
+	net.Conn
+	upstream net.Conn
+	done     chan struct{}
+	once     sync.Once
+}
+
+func (c *relayConn) Close() error {
+	c.once.Do(func() { close(c.done); _ = c.Conn.Close(); _ = c.upstream.Close() })
+	return nil
+}
+
+// For cancellation (pause, quota, shutdown or a transport error), a reset tells
+// HAProxy that the upstream must be abandoned, even if it ignores a half-close.
+// Normal EOF still uses CloseWrite and drains the response before Close.
+func (c *relayConn) abort() {
+	c.once.Do(func() {
+		close(c.done)
+		for _, conn := range []net.Conn{c.Conn, c.upstream} {
+			if tcp, ok := conn.(*net.TCPConn); ok {
+				_ = tcp.SetLinger(0)
+			}
+			_ = conn.Close()
+		}
+	})
+}
+func (a *App) routeStates() []*RouteState {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	out := make([]*RouteState, 0, len(a.routes))
+	for _, s := range a.routes {
+		out = append(out, s)
+	}
+	return out
+}
 func (a *App) startListeners() error {
-	fallback, err := net.Listen("tcp", "127.0.0.1:9999")
+	l, err := net.Listen("tcp", "127.0.0.1:9999")
 	if err != nil {
 		return err
 	}
-	go func() {
-		for {
-			c, e := fallback.Accept()
-			if e != nil {
-				return
-			}
-			go relayFallback(c)
-		}
-	}()
-	a.mu.RLock()
-	routes := make([]*RouteState, 0, len(a.routes))
-	for _, s := range a.routes {
-		routes = append(routes, s)
-	}
-	a.mu.RUnlock()
-	for _, s := range routes {
+	a.fallbackListener = l
+	a.acceptRelay(l, nil)
+	for _, s := range a.routeStates() {
 		if err := a.listenRoute(s); err != nil {
 			return err
 		}
 	}
 	return nil
 }
-func relayFallback(client net.Conn) {
-	defer client.Close()
-	up, err := net.DialTimeout("tcp", "127.0.0.1:8443", 5*time.Second)
-	if err != nil {
-		return
-	}
-	defer up.Close()
-	go func() {
-		_, _ = io.Copy(up, client)
-		if t, ok := up.(*net.TCPConn); ok {
-			_ = t.CloseWrite()
-		}
-	}()
-	_, _ = io.Copy(client, up)
-}
 func (a *App) listenRoute(s *RouteState) error {
-	addr := fmt.Sprintf("127.0.0.1:%d", 10000+s.Route.ID)
-	l, err := net.Listen("tcp", addr)
+	s.mu.Lock()
+	id := s.Route.ID
+	s.mu.Unlock()
+	l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", 10000+id))
 	if err != nil {
 		return err
 	}
 	s.mu.Lock()
 	s.Listener = l
 	s.mu.Unlock()
-	go func() {
-		for {
-			c, e := l.Accept()
-			if e != nil {
-				return
-			}
-			go a.handleConn(s, c)
-		}
-	}()
-	go a.checkHealth(s)
+	a.acceptRelay(l, s)
 	return nil
 }
-func (a *App) checkHealth(s *RouteState) {
-	s.mu.Lock()
-	addr := net.JoinHostPort(s.Route.IP, fmt.Sprint(s.Route.Port))
-	s.mu.Unlock()
-	c, err := net.DialTimeout("tcp", addr, 2*time.Second)
-	if err == nil {
-		_ = c.Close()
-	}
-	s.mu.Lock()
-	previous := s.healthy
-	s.healthy = err == nil
-	route := s.Route
-	now := time.Now()
-	alert := false
-	recovered := false
-	if err == nil {
-		recovered = s.alertSent && route.Monitor
-		s.unhealthySince = time.Time{}
-		s.alertSent = false
-	} else if route.Monitor {
-		if s.unhealthySince.IsZero() {
-			s.unhealthySince = now
+func (a *App) acceptRelay(l net.Listener, s *RouteState) {
+	a.listenersWG.Add(1)
+	go func() {
+		defer a.listenersWG.Done()
+		var delay time.Duration
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				if errors.Is(err, net.ErrClosed) || a.closing.Load() {
+					return
+				}
+				// EMFILE must not silently abandon an open listener.
+				if delay == 0 {
+					delay = 5 * time.Millisecond
+				} else {
+					delay *= 2
+				}
+				if delay > time.Second {
+					delay = time.Second
+				}
+				log.Printf("relay accept: %v; retrying in %s", err, delay)
+				time.Sleep(delay)
+				continue
+			}
+			delay = 0
+			a.relayWG.Add(1)
+			go func() { defer a.relayWG.Done(); a.handleConn(s, c) }()
 		}
-		if !s.alertSent && now.Sub(s.unhealthySince) >= 5*time.Minute {
-			s.alertSent = true
-			alert = true
+	}()
+}
+func (a *App) stopRelays() {
+	a.closing.Store(true)
+	if a.fallbackListener != nil {
+		_ = a.fallbackListener.Close()
+	}
+	states := a.routeStates()
+	for _, s := range states {
+		s.mu.Lock()
+		if s.Listener != nil {
+			_ = s.Listener.Close()
 		}
-	} else {
-		s.unhealthySince = time.Time{}
-		s.alertSent = false
+		s.mu.Unlock()
 	}
-	s.mu.Unlock()
-	if alert {
-		go a.notify(route, fmt.Sprintf("Конечный сервер не отвечает более 5 минут. Адрес: %s:%d. Последняя проверка: %s.", route.IP, route.Port, now.In(a.location).Format("2006-01-02 15:04:05 MST")))
+	a.listenersWG.Wait()
+	for _, s := range states {
+		a.closeRouteConns(s)
 	}
-	if recovered && !previous {
-		go a.notify(route, fmt.Sprintf("Доступ к конечному серверу восстановлен: %s:%d.", route.IP, route.Port))
-	}
+	a.fallbackConns.Range(func(key, _ any) bool { key.(*relayConn).abort(); return true })
+	a.relayWG.Wait()
 }
 func (a *App) handleConn(s *RouteState, client net.Conn) {
+	defer client.Close()
+	if a.closing.Load() {
+		return
+	}
+	if s != nil {
+		s.mu.Lock()
+		r := s.Route
+		blocked, deleted := s.blocked(), s.deleted
+		s.mu.Unlock()
+		if deleted {
+			return
+		}
+		if blocked || r.Paused {
+			// Never tunnel blocked traffic unmetered while HAProxy is reloading.
+			a.rejectConn(client, r)
+			return
+		}
+	}
 	upstream, err := net.DialTimeout("tcp", "127.0.0.1:8443", 5*time.Second)
 	if err != nil {
-		_ = client.Close()
 		return
 	}
-	s.mu.Lock()
-	blockedOnEntry := s.blocked() || s.Route.Paused
-	s.conns[client] = struct{}{}
-	s.mu.Unlock()
-	defer func() { _ = client.Close(); _ = upstream.Close(); s.mu.Lock(); delete(s.conns, client); s.mu.Unlock() }()
-	if blockedOnEntry {
-		go func() {
-			_, _ = io.Copy(upstream, client)
-			if t, ok := upstream.(*net.TCPConn); ok {
-				_ = t.CloseWrite()
-			}
-		}()
-		_, _ = io.Copy(client, upstream)
-		return
-	}
-	var once sync.Once
-	stop := func() { once.Do(func() { _ = client.Close(); _ = upstream.Close() }) }
-	done := make(chan struct{})
-	go func() {
-		a.copyMetered(s, upstream, client, true, stop)
-		if t, ok := upstream.(*net.TCPConn); ok {
-			_ = t.CloseWrite()
+	pair := &relayConn{Conn: client, upstream: upstream, done: make(chan struct{})}
+	defer pair.Close()
+	if s != nil {
+		s.mu.Lock()
+		if a.closing.Load() || s.deleted || s.Route.Paused || s.blocked() {
+			s.mu.Unlock()
+			return
 		}
-		close(done)
-	}()
-	a.copyMetered(s, client, upstream, false, stop)
-	if t, ok := client.(*net.TCPConn); ok {
-		_ = t.CloseWrite()
+		s.conns[pair] = struct{}{}
+		s.mu.Unlock()
+		defer func() { s.mu.Lock(); delete(s.conns, pair); s.mu.Unlock() }()
+	} else {
+		a.fallbackConns.Store(pair, struct{}{})
+		defer a.fallbackConns.Delete(pair)
+		if a.closing.Load() {
+			return
+		}
 	}
+	a.relayDuplex(s, pair)
+}
+func (a *App) rejectConn(client net.Conn, r Route) {
+	certPath := filepath.Join(a.data, "certs", routeCert(r)+".pem")
+	cert, err := tls.LoadX509KeyPair(certPath, certPath)
+	if err != nil {
+		return
+	}
+	_ = client.SetDeadline(time.Now().Add(5 * time.Second))
+	c := tls.Server(client, &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12, NextProtos: []string{"http/1.1"}})
+	if err := c.Handshake(); err != nil {
+		return
+	}
+	if _, err := http.ReadRequest(bufio.NewReader(io.LimitReader(c, 32<<10))); err != nil {
+		return
+	}
+	status := http.StatusTooManyRequests
+	if r.Paused {
+		status = http.StatusServiceUnavailable
+	}
+	body := http.StatusText(status) + "\n"
+	_, _ = fmt.Fprintf(c, "HTTP/1.1 %d %s\r\nContent-Type: text/plain\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", status, http.StatusText(status), len(body), body)
+	_ = c.Close()
+}
+func (a *App) relayDuplex(s *RouteState, pair *relayConn) {
+	done := make(chan struct{}, 2)
+	pump := func(dst, src net.Conn, up bool) {
+		err := a.copyMetered(s, dst, src, up, pair.done)
+		if err != nil {
+			pair.abort()
+		} else if tcp, ok := dst.(*net.TCPConn); ok {
+			_ = tcp.CloseWrite()
+		}
+		done <- struct{}{}
+	}
+	go pump(pair.upstream, pair.Conn, true)
+	pump(pair.Conn, pair.upstream, false)
+	<-done
 	<-done
 }
-func (a *App) copyMetered(s *RouteState, dst, src net.Conn, up bool, stop func()) {
-	buf := make([]byte, 32*1024)
+
+// take applies one shared bucket per route and direction, with s.mu held.
+func (b *bucket) take(want int, rate int64, now time.Time) (int, time.Duration) {
+	if rate <= 0 {
+		b.rate = 0
+		b.last = time.Time{}
+		return want, 0
+	}
+	if b.last.IsZero() || b.rate == 0 {
+		b.tokens = float64(rate)
+	} else {
+		b.tokens += now.Sub(b.last).Seconds() * float64(b.rate)
+	}
+	b.last, b.rate = now, rate
+	if b.tokens > float64(rate) {
+		b.tokens = float64(rate)
+	}
+	if b.tokens < 1 {
+		target := min(float64(want), max(1, float64(rate)/100))
+		return 0, max(time.Millisecond, time.Duration((target-b.tokens)/float64(rate)*float64(time.Second)))
+	}
+	n := min(want, int(b.tokens))
+	b.tokens -= float64(n)
+	return n, 0
+}
+func waitRelay(done <-chan struct{}, delay time.Duration) error {
+	t := time.NewTimer(delay)
+	defer t.Stop()
+	select {
+	case <-done:
+		return net.ErrClosed
+	case <-t.C:
+		return nil
+	}
+}
+func (a *App) copyMetered(s *RouteState, dst, src net.Conn, up bool, done <-chan struct{}) error {
+	p := relayBuffers.Get().(*[]byte)
+	defer relayBuffers.Put(p)
+	buf := *p
 	for {
-		n, err := src.Read(buf)
-		if n > 0 {
-			offset := 0
-			for offset < n {
+		_ = src.SetReadDeadline(time.Now().Add(relayIdleTimeout))
+		n, readErr := src.Read(buf)
+		for offset := 0; offset < n; {
+			allowed := n - offset
+			var dk, mk string
+			var counted bool
+			if s != nil {
 				s.mu.Lock()
-				blocked := s.blocked()
-				paused := s.Route.Paused
-				if blocked || paused {
+				if s.deleted || s.Route.Paused || s.blocked() {
 					s.mu.Unlock()
-					if blocked || paused {
-						stop()
-						return
-					}
+					return net.ErrClosed
 				}
-				limit := s.Route.DownBPS
-				bucket := &s.downBucket
-				if up {
-					limit = s.Route.UpBPS
-					bucket = &s.upBucket
-				}
-				allowed := n - offset
-				if s.counted(up) {
+				counted = s.counted(up)
+				if counted {
 					if s.Route.DailyLimit > 0 {
-						left := s.Route.DailyLimit + s.Daily.Extra - s.Daily.Used
-						if int64(allowed) > left {
-							allowed = int(left)
-						}
+						allowed = min(allowed, int(max(0, s.Route.DailyLimit+s.Daily.Extra-s.Daily.Used-s.reservedDaily)))
 					}
 					if s.Route.MonthlyLimit > 0 {
-						left := s.Route.MonthlyLimit + s.Monthly.Extra - s.Monthly.Used
-						if int64(allowed) > left {
-							allowed = int(left)
-						}
+						allowed = min(allowed, int(max(0, s.Route.MonthlyLimit+s.Monthly.Extra-s.Monthly.Used-s.reservedMonthly)))
 					}
 				}
-				if allowed <= 0 {
+				if allowed == 0 {
 					s.mu.Unlock()
-					a.exhaust(s)
-					stop()
-					return
+					if err := waitRelay(done, time.Millisecond); err != nil {
+						return err
+					}
+					continue
 				}
-				if limit > 0 {
-					now := time.Now()
-					if bucket.last.IsZero() {
-						bucket.last = now
-						bucket.tokens = float64(limit)
-					} else {
-						bucket.tokens += now.Sub(bucket.last).Seconds() * float64(limit)
-						if bucket.tokens > float64(limit) {
-							bucket.tokens = float64(limit)
-						}
-						bucket.last = now
-					}
-					if bucket.tokens < 1 {
-						s.mu.Unlock()
-						time.Sleep(10 * time.Millisecond)
-						continue
-					}
-					if float64(allowed) > bucket.tokens {
-						allowed = int(bucket.tokens)
-					}
-					bucket.tokens -= float64(allowed)
-				}
+				limit, b := s.Route.DownBPS, &s.downBucket
 				if up {
-					s.Route.UpTotal += int64(allowed)
-					s.pendingUp += int64(allowed)
-				} else {
-					s.Route.DownTotal += int64(allowed)
-					s.pendingDown += int64(allowed)
+					limit, b = s.Route.UpBPS, &s.upBucket
 				}
-				if s.counted(up) {
-					s.Daily.Used += int64(allowed)
-					s.Monthly.Used += int64(allowed)
+				var delay time.Duration
+				allowed, delay = b.take(allowed, limit, time.Now())
+				if delay > 0 {
+					s.mu.Unlock()
+					if err := waitRelay(done, delay); err != nil {
+						return err
+					}
+					continue
 				}
-				newBlocked := s.blocked()
+				if counted {
+					dk, mk = s.Daily.Key, s.Monthly.Key
+					s.reservedDaily += int64(allowed)
+					s.reservedMonthly += int64(allowed)
+				}
 				s.mu.Unlock()
-				written, e := dst.Write(buf[offset : offset+allowed])
-				offset += written
-				if e != nil || written != allowed {
-					stop()
-					return
+			}
+			_ = dst.SetWriteDeadline(time.Now().Add(relayIdleTimeout))
+			written, err := dst.Write(buf[offset : offset+allowed])
+			offset += written
+			if s != nil {
+				s.mu.Lock()
+				if up {
+					s.Route.UpTotal += int64(written)
+					s.pendingUp += int64(written)
+				} else {
+					s.Route.DownTotal += int64(written)
+					s.pendingDown += int64(written)
 				}
-				if newBlocked {
+				if counted {
+					if s.Daily.Key == dk {
+						s.reservedDaily -= int64(allowed)
+						s.Daily.Used += int64(written)
+					} else if p, ok := s.retired["daily:"+dk]; ok {
+						p.reserved -= int64(allowed)
+						p.Used += int64(written)
+						s.retired["daily:"+dk] = p
+					}
+					if s.Monthly.Key == mk {
+						s.reservedMonthly -= int64(allowed)
+						s.Monthly.Used += int64(written)
+					} else if p, ok := s.retired["monthly:"+mk]; ok {
+						p.reserved -= int64(allowed)
+						p.Used += int64(written)
+						s.retired["monthly:"+mk] = p
+					}
+				}
+				blocked := s.blocked()
+				s.mu.Unlock()
+				if blocked {
 					a.exhaust(s)
-					stop()
-					return
+					return net.ErrClosed
 				}
 			}
+			if err != nil {
+				return err
+			}
+			if written != allowed {
+				return io.ErrShortWrite
+			}
 		}
-		if err != nil {
-			return
+		if readErr == io.EOF {
+			return nil
+		}
+		if readErr != nil {
+			return readErr
 		}
 	}
 }
@@ -250,107 +360,116 @@ func (a *App) exhaust(s *RouteState) {
 	r := s.Route
 	daily := r.DailyLimit > 0 && s.Daily.Used >= r.DailyLimit+s.Daily.Extra
 	monthly := r.MonthlyLimit > 0 && s.Monthly.Used >= r.MonthlyLimit+s.Monthly.Extra
-	first := (daily && !s.Daily.ExhaustedSent) || (monthly && !s.Monthly.ExhaustedSent)
 	if daily && !s.Daily.ExhaustedSent {
-		s.Daily.ExhaustedSent = true
-		s.Daily.ThresholdSent = true
+		s.Daily.ExhaustedSent, s.Daily.ThresholdSent = true, true
 		go a.notify(r, quotaExhaustedMessage("daily", s.Daily.Used, r.DailyLimit+s.Daily.Extra))
 	}
 	if monthly && !s.Monthly.ExhaustedSent {
-		s.Monthly.ExhaustedSent = true
-		s.Monthly.ThresholdSent = true
+		s.Monthly.ExhaustedSent, s.Monthly.ThresholdSent = true, true
 		go a.notify(r, quotaExhaustedMessage("monthly", s.Monthly.Used, r.MonthlyLimit+s.Monthly.Extra))
 	}
-	for c := range s.conns {
+	s.mu.Unlock()
+	a.closeRouteConns(s)
+	// Quota changes are enforced locally and need neither disk I/O nor reload.
+}
+func (a *App) checkHealth(s *RouteState) {
+	s.mu.Lock()
+	r := s.Route
+	s.mu.Unlock()
+	c, err := net.DialTimeout("tcp", net.JoinHostPort(r.IP, fmt.Sprint(r.Port)), 2*time.Second)
+	if err == nil {
 		_ = c.Close()
 	}
-	s.mu.Unlock()
-	if !first {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.deleted || r.IP != s.Route.IP || r.Port != s.Route.Port {
 		return
 	}
-	if err := a.writeConfig(); err != nil {
-		log.Printf("quota config: %v", err)
+	s.healthy = err == nil
+	now := time.Now()
+	if err == nil {
+		if s.alertSent && s.Route.Monitor {
+			go a.notify(r, fmt.Sprintf("Доступ к конечному серверу восстановлен: %s:%d.", r.IP, r.Port))
+		}
+		s.unhealthySince, s.alertSent = time.Time{}, false
+	} else if s.Route.Monitor {
+		if s.unhealthySince.IsZero() {
+			s.unhealthySince = now
+		}
+		if !s.alertSent && now.Sub(s.unhealthySince) >= 5*time.Minute {
+			s.alertSent = true
+			go a.notify(r, fmt.Sprintf("Конечный сервер не отвечает более 5 минут. Адрес: %s:%d.", r.IP, r.Port))
+		}
+	} else {
+		s.unhealthySince, s.alertSent = time.Time{}, false
 	}
 }
-func (a *App) tick() {
+func (a *App) tick(ctx context.Context) {
+	var workers sync.WaitGroup
+	// Fixed workers cannot pile up when SQLite or a health probe is slow.
+	run := func(interval time.Duration, fn func(time.Time)) {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			t := time.NewTicker(interval)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case now := <-t.C:
+					fn(now)
+				}
+			}
+		}()
+	}
+	run(10*time.Second, a.collectRequestStats)
+	run(time.Second, a.sampleRates)
+	run(time.Minute, a.checkRentals)
+	run(10*time.Second, func(_ time.Time) {
+		limit := make(chan struct{}, 16)
+		var wg sync.WaitGroup
+		for _, s := range a.routeStates() {
+			select {
+			case <-ctx.Done():
+				wg.Wait()
+				return
+			case limit <- struct{}{}:
+			}
+			wg.Add(1)
+			go func(s *RouteState) { defer wg.Done(); defer func() { <-limit }(); a.checkHealth(s) }(s)
+		}
+		wg.Wait()
+	})
+	run(time.Hour, func(now time.Time) {
+		for _, table := range []string{"samples", "request_samples"} {
+			if _, err := a.db.Exec("DELETE FROM "+table+" WHERE ts<?", now.AddDate(0, 0, -90).Unix()); err != nil {
+				log.Printf("history cleanup: %v", err)
+			}
+		}
+	})
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
-	for now := range t.C {
-		if now.Unix()%10 == 0 {
-			go a.collectRequestStats(now)
-		}
-		if now.Second() == 0 {
-			go a.checkRentals(now)
-		}
-		a.mu.RLock()
-		routes := make([]*RouteState, 0, len(a.routes))
-		for _, s := range a.routes {
-			routes = append(routes, s)
-		}
-		a.mu.RUnlock()
-		changed := false
-		for _, s := range routes {
-			if now.Unix()%10 == 0 {
-				go a.checkHealth(s)
+	defer workers.Wait()
+	interval := a.flushInterval
+	if interval == 0 {
+		interval = 5 * time.Second
+	}
+	lastFlush := time.Now()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-t.C:
+			if now.Sub(lastFlush) >= interval {
+				if err := a.flushTraffic(now); err != nil {
+					log.Printf("traffic persistence: %v", err)
+				}
+				lastFlush = now
 			}
-			s.mu.Lock()
-			before := s.blocked()
-			if a.refreshPeriods(s, now) {
-				changed = true
+			if err := a.rollPeriods(now); err != nil {
+				log.Printf("quota rollover: %v", err)
 			}
-			after := s.blocked()
-			if before != after {
-				changed = true
-			}
-			r := s.Route
-			up, down := s.pendingUp, s.pendingDown
-			s.lastUp, s.lastDown = up, down
-			s.pendingUp = 0
-			s.pendingDown = 0
-			if r.DailyLimit > 0 && !s.Daily.ThresholdSent && !s.Daily.ExhaustedSent && quotaReachedThreshold(s.Daily.Used, r.DailyLimit+s.Daily.Extra, r.Threshold) {
-				s.Daily.ThresholdSent = true
-				go a.notify(r, quotaThresholdMessage("daily", s.Daily.Used, r.DailyLimit+s.Daily.Extra))
-			}
-			if r.MonthlyLimit > 0 && !s.Monthly.ThresholdSent && !s.Monthly.ExhaustedSent && quotaReachedThreshold(s.Monthly.Used, r.MonthlyLimit+s.Monthly.Extra, r.Threshold) {
-				s.Monthly.ThresholdSent = true
-				go a.notify(r, quotaThresholdMessage("monthly", s.Monthly.Used, r.MonthlyLimit+s.Monthly.Extra))
-			}
-			d, m := s.Daily, s.Monthly
-			s.mu.Unlock()
-			if up == 0 && down == 0 && !changed {
-				continue
-			}
-			tx, err := a.db.Begin()
-			if err != nil {
-				log.Printf("db: %v", err)
-				continue
-			}
-			_, err = tx.Exec("UPDATE routes SET up_total=?,down_total=? WHERE id=?", r.UpTotal, r.DownTotal, r.ID)
-			if err == nil {
-				_, err = tx.Exec("INSERT INTO periods(route_id,kind,key,used,extra,threshold_sent,exhausted_sent) VALUES(?,?,?,?,?,?,?) ON CONFLICT(route_id,kind,key) DO UPDATE SET used=excluded.used,extra=excluded.extra,threshold_sent=excluded.threshold_sent,exhausted_sent=excluded.exhausted_sent", r.ID, "daily", d.Key, d.Used, d.Extra, boolInt(d.ThresholdSent), boolInt(d.ExhaustedSent))
-			}
-			if err == nil {
-				_, err = tx.Exec("INSERT INTO periods(route_id,kind,key,used,extra,threshold_sent,exhausted_sent) VALUES(?,?,?,?,?,?,?) ON CONFLICT(route_id,kind,key) DO UPDATE SET used=excluded.used,extra=excluded.extra,threshold_sent=excluded.threshold_sent,exhausted_sent=excluded.exhausted_sent", r.ID, "monthly", m.Key, m.Used, m.Extra, boolInt(m.ThresholdSent), boolInt(m.ExhaustedSent))
-			}
-			if err == nil && up+down > 0 {
-				minute := now.Unix() / 60 * 60
-				_, err = tx.Exec("INSERT INTO samples(route_id,ts,up,down) VALUES(?,?,?,?) ON CONFLICT(route_id,ts) DO UPDATE SET up=up+excluded.up,down=down+excluded.down", r.ID, minute, up, down)
-			}
-			if err != nil {
-				_ = tx.Rollback()
-				log.Printf("db: %v", err)
-			} else if err = tx.Commit(); err != nil {
-				log.Printf("db commit: %v", err)
-			}
-		}
-		if changed {
-			if err := a.writeConfig(); err != nil {
-				log.Printf("period config: %v", err)
-			}
-		}
-		if now.Minute() == 0 && now.Second() == 0 {
-			_, _ = a.db.Exec("DELETE FROM samples WHERE ts<?", now.AddDate(0, 0, -90).Unix())
-			_, _ = a.db.Exec("DELETE FROM request_samples WHERE ts<?", now.AddDate(0, 0, -90).Unix())
 		}
 	}
 }

@@ -11,6 +11,8 @@ RuntimeDirectory=fluxgate
 ExecStart=/usr/local/libexec/fluxgate-watch
 Restart=always
 RestartSec=2
+LimitNOFILE=262144
+TimeoutStopSec=30
 
 [Install]
 WantedBy=multi-user.target

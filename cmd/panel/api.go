@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -71,9 +72,10 @@ func (a *App) newSession() string {
 	h.Write(raw)
 	return base64.RawURLEncoding.EncodeToString(raw) + "." + base64.RawURLEncoding.EncodeToString(h.Sum(nil))
 }
-func (a *App) serveAdmin() {
+func (a *App) adminServer() *http.Server {
 	mux := http.NewServeMux()
 	base := "/" + a.secretPath + "/"
+	mux.HandleFunc("/healthz", a.healthAPI)
 	mux.HandleFunc(base+"api/login", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "POST" {
 			fail(w, 405, "method")
@@ -136,7 +138,7 @@ func (a *App) serveAdmin() {
 	listen := env("PANEL_LISTEN", "0.0.0.0:9389")
 	server := &http.Server{Addr: listen, Handler: mux, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second}
 	log.Printf("panel listening on http://%s/%s/", listen, a.secretPath)
-	log.Fatal(server.ListenAndServe())
+	return server
 }
 func (a *App) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -185,8 +187,11 @@ func (a *App) routesAPI(w http.ResponseWriter, r *http.Request) {
 			list = append(list, v)
 		}
 		a.mu.RUnlock()
+		sort.Slice(list, func(i, j int) bool { return list[i].ID < list[j].ID })
 		writeJSON(w, 200, list)
 	case "POST":
+		a.stateMu.Lock()
+		defer a.stateMu.Unlock()
 		var v Route
 		if readJSON(r, &v) != nil {
 			fail(w, 400, "invalid JSON")
@@ -236,6 +241,8 @@ func (a *App) createRoute(w http.ResponseWriter, v Route) {
 		fail(w, 400, "main domain is reserved for fallback")
 		return
 	}
+	// Read-only counters in a POST are never accepted as initial usage.
+	v.UpTotal, v.DownTotal = 0, 0
 	v.CreatedAt = time.Now().Unix()
 	a.mu.Lock()
 	result, e := a.db.Exec("INSERT INTO routes(name,sni,ip,port,tls,verify,verify_name,paused,daily_limit,monthly_limit,count_mode,down_bps,up_bps,threshold,created_at,monitor) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", v.Name, v.SNI, v.IP, v.Port, boolInt(v.TLS), boolInt(v.Verify), v.VerifyName, boolInt(v.Paused), v.DailyLimit, v.MonthlyLimit, v.CountMode, v.DownBPS, v.UpBPS, v.Threshold, v.CreatedAt, boolInt(v.Monitor))
@@ -252,7 +259,12 @@ func (a *App) createRoute(w http.ResponseWriter, v Route) {
 		return
 	}
 	s := &RouteState{Route: v, conns: map[net.Conn]struct{}{}}
-	a.refreshPeriods(s, time.Now())
+	if e = a.refreshPeriods(s, time.Now()); e != nil {
+		_, _ = a.db.Exec("DELETE FROM routes WHERE id=?", v.ID)
+		a.mu.Unlock()
+		fail(w, 500, e.Error())
+		return
+	}
 	a.routes[v.ID] = s
 	a.mu.Unlock()
 	if e = a.ensureCert(routeCert(v), v.SNI); e == nil {
@@ -275,6 +287,8 @@ func (a *App) createRoute(w http.ResponseWriter, v Route) {
 	writeJSON(w, 201, v)
 }
 func (a *App) routeAPI(w http.ResponseWriter, r *http.Request) {
+	a.stateMu.Lock()
+	defer a.stateMu.Unlock()
 	part := strings.TrimPrefix(r.URL.Path, "/"+a.secretPath+"/api/routes/")
 	items := strings.Split(strings.Trim(part, "/"), "/")
 	id, e := strconv.ParseInt(items[0], 10, 64)
@@ -322,6 +336,7 @@ func (a *App) routeAPI(w http.ResponseWriter, r *http.Request) {
 		}
 		s.mu.Lock()
 		oldDaily, oldMonthly := s.Daily, s.Monthly
+		v.UpTotal, v.DownTotal = s.Route.UpTotal, s.Route.DownTotal
 		s.Route = v
 		rearmQuota(&s.Daily, v.DailyLimit+s.Daily.Extra, v.Threshold)
 		rearmQuota(&s.Monthly, v.MonthlyLimit+s.Monthly.Extra, v.Threshold)
@@ -331,8 +346,7 @@ func (a *App) routeAPI(w http.ResponseWriter, r *http.Request) {
 		}
 		if e != nil {
 			s.mu.Lock()
-			s.Route = old
-			s.Daily, s.Monthly = oldDaily, oldMonthly
+			s.restoreRoute(old, oldDaily, oldMonthly)
 			s.mu.Unlock()
 			fail(w, 400, e.Error())
 			return
@@ -340,8 +354,7 @@ func (a *App) routeAPI(w http.ResponseWriter, r *http.Request) {
 		_, e = a.db.Exec("UPDATE routes SET name=?,sni=?,ip=?,port=?,tls=?,verify=?,verify_name=?,paused=?,daily_limit=?,monthly_limit=?,count_mode=?,down_bps=?,up_bps=?,threshold=?,monitor=? WHERE id=?", v.Name, v.SNI, v.IP, v.Port, boolInt(v.TLS), boolInt(v.Verify), v.VerifyName, boolInt(v.Paused), v.DailyLimit, v.MonthlyLimit, v.CountMode, v.DownBPS, v.UpBPS, v.Threshold, boolInt(v.Monitor), id)
 		if e != nil {
 			s.mu.Lock()
-			s.Route = old
-			s.Daily, s.Monthly = oldDaily, oldMonthly
+			s.restoreRoute(old, oldDaily, oldMonthly)
 			s.mu.Unlock()
 			_ = a.writeConfig()
 			fail(w, 500, e.Error())
@@ -371,19 +384,42 @@ func (a *App) routeAPI(w http.ResponseWriter, r *http.Request) {
 			fail(w, 500, e.Error())
 			return
 		}
-		a.closeRouteConns(s)
+		tx, err := a.db.Begin()
+		if err == nil {
+			for _, table := range []string{"routes", "periods", "samples", "request_totals", "request_samples", "rentals", "payments"} {
+				column := "route_id"
+				if table == "routes" {
+					column = "id"
+				}
+				if _, err = tx.Exec("DELETE FROM "+table+" WHERE "+column+"=?", id); err != nil {
+					break
+				}
+			}
+			if err == nil {
+				err = tx.Commit()
+			} else {
+				_ = tx.Rollback()
+			}
+		}
+		if err != nil {
+			a.mu.Lock()
+			a.routes[id] = s
+			a.mu.Unlock()
+			_ = a.writeConfig()
+			fail(w, 500, err.Error())
+			return
+		}
 		s.mu.Lock()
+		s.deleted = true
 		if s.Listener != nil {
 			_ = s.Listener.Close()
 		}
 		s.mu.Unlock()
-		_, _ = a.db.Exec("DELETE FROM routes WHERE id=?", id)
-		_, _ = a.db.Exec("DELETE FROM periods WHERE route_id=?", id)
-		_, _ = a.db.Exec("DELETE FROM samples WHERE route_id=?", id)
-		_, _ = a.db.Exec("DELETE FROM request_totals WHERE route_id=?", id)
-		_, _ = a.db.Exec("DELETE FROM request_samples WHERE route_id=?", id)
-		_, _ = a.db.Exec("DELETE FROM rentals WHERE route_id=?", id)
-		_, _ = a.db.Exec("DELETE FROM payments WHERE route_id=?", id)
+		a.closeRouteConns(s)
+		delete(a.lastStats, id)
+		a.statsMu.Lock()
+		delete(a.liveStats, id)
+		a.statsMu.Unlock()
 		files, _ := filepath.Glob(filepath.Join(a.data, "certs", fmt.Sprintf("route_%d_*.pem", id)))
 		for _, f := range files {
 			_ = os.Remove(f)
@@ -395,10 +431,26 @@ func (a *App) routeAPI(w http.ResponseWriter, r *http.Request) {
 }
 func (a *App) closeRouteConns(s *RouteState) {
 	s.mu.Lock()
+	conns := make([]net.Conn, 0, len(s.conns))
 	for c := range s.conns {
-		_ = c.Close()
+		conns = append(conns, c)
 	}
 	s.mu.Unlock()
+	for _, c := range conns {
+		if pair, ok := c.(*relayConn); ok {
+			pair.abort()
+		} else {
+			_ = c.Close()
+		}
+	}
+}
+
+// Roll back configuration without discarding traffic recorded during validation.
+func (s *RouteState) restoreRoute(old Route, daily, monthly Period) {
+	old.UpTotal, old.DownTotal = s.Route.UpTotal, s.Route.DownTotal
+	s.Route = old
+	s.Daily.ThresholdSent, s.Daily.ExhaustedSent = daily.ThresholdSent, daily.ExhaustedSent
+	s.Monthly.ThresholdSent, s.Monthly.ExhaustedSent = monthly.ThresholdSent, monthly.ExhaustedSent
 }
 func (a *App) topup(w http.ResponseWriter, r *http.Request, s *RouteState) {
 	if r.Method != "POST" {
@@ -431,25 +483,21 @@ func (a *App) topup(w http.ResponseWriter, r *http.Request, s *RouteState) {
 		fail(w, 400, "topup is too large")
 		return
 	}
-	previous := *p
-	wasBlocked := s.blocked()
-	p.Extra += req.Bytes
-	newLimit := baseLimit + p.Extra
-	rearmQuota(p, newLimit, s.Route.Threshold)
 	period := *p
+	period.Extra += req.Bytes
+	newLimit := baseLimit + period.Extra
+	rearmQuota(&period, newLimit, s.Route.Threshold)
 	rte := s.Route
+	s.mu.Unlock()
 	_, err := a.db.Exec("INSERT INTO periods(route_id,kind,key,used,extra,threshold_sent,exhausted_sent) VALUES(?,?,?,?,?,?,?) ON CONFLICT(route_id,kind,key) DO UPDATE SET extra=excluded.extra,threshold_sent=excluded.threshold_sent,exhausted_sent=excluded.exhausted_sent", rte.ID, req.Kind, period.Key, period.Used, period.Extra, boolInt(period.ThresholdSent), boolInt(period.ExhaustedSent))
 	if err != nil {
-		*p = previous
-		s.mu.Unlock()
 		fail(w, 500, err.Error())
 		return
 	}
-	nowBlocked := s.blocked()
+	s.mu.Lock()
+	p.Extra = period.Extra
+	rearmQuota(p, newLimit, s.Route.Threshold)
 	s.mu.Unlock()
-	if wasBlocked != nowBlocked {
-		_ = a.writeConfig()
-	}
 	a.notify(rte, quotaTopupMessage(req.Kind, req.Bytes, oldLimit, newLimit, period.Used))
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
@@ -461,6 +509,8 @@ func (a *App) settingsAPI(w http.ResponseWriter, r *http.Request) {
 		a.mu.RUnlock()
 		writeJSON(w, 200, v)
 	case "PUT":
+		a.stateMu.Lock()
+		defer a.stateMu.Unlock()
 		var v struct {
 			Domain       string `json:"domain"`
 			FallbackHTML string `json:"fallback_html"`

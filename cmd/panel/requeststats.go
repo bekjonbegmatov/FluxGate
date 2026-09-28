@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -92,52 +93,70 @@ func readHAProxyStats(path string) (map[int64]requestCounter, error) {
 	return out, nil
 }
 func (a *App) collectRequestStats(now time.Time) {
-	a.statsMu.Lock()
-	defer a.statsMu.Unlock()
+	a.collectMu.Lock()
+	defer a.collectMu.Unlock()
 	observed, err := readHAProxyStats(filepath.Join(a.data, "haproxy.sock"))
 	if err != nil {
 		log.Printf("haproxy stats: %v", err)
 		return
 	}
+	a.stateMu.Lock()
+	defer a.stateMu.Unlock()
 	if a.lastStats == nil {
 		a.lastStats = observed
 		a.lastStatsAt = now
 		return
 	}
-	elapsed := now.Sub(a.lastStatsAt).Seconds()
-	if elapsed < 1 {
-		elapsed = 1
+	elapsed := max(1, now.Sub(a.lastStatsAt).Seconds())
+	deltas := map[int64]requestCounter{}
+	a.statsMu.Lock()
+	if a.liveStats == nil {
+		a.liveStats = map[int64]RequestStats{}
 	}
 	for id, current := range observed {
+		a.mu.RLock()
+		_, exists := a.routes[id]
+		a.mu.RUnlock()
+		if !exists {
+			delete(observed, id)
+			delete(a.liveStats, id)
+			continue
+		}
 		previous, known := a.lastStats[id]
-		if !known {
-			a.lastStats[id] = current
-			continue
+		d := requestCounter{}
+		if known {
+			d = requestCounter{requests: deltaCounter(current.requests, previous.requests), r2: deltaCounter(current.r2, previous.r2), r3: deltaCounter(current.r3, previous.r3), r4: deltaCounter(current.r4, previous.r4), r5: deltaCounter(current.r5, previous.r5)}
 		}
-		d := requestCounter{requests: deltaCounter(current.requests, previous.requests), r2: deltaCounter(current.r2, previous.r2), r3: deltaCounter(current.r3, previous.r3), r4: deltaCounter(current.r4, previous.r4), r5: deltaCounter(current.r5, previous.r5)}
 		a.liveStats[id] = RequestStats{RouteID: id, Active: current.active, Rate: float64(d.requests) / elapsed, ResponseMS: current.responseMS, UpdatedAt: now.Unix()}
-		if d.requests+d.r2+d.r3+d.r4+d.r5 == 0 {
-			continue
-		}
-		tx, e := a.db.Begin()
-		if e != nil {
-			log.Printf("request stats db: %v", e)
-			continue
-		}
-		_, e = tx.Exec("INSERT INTO request_totals(route_id,requests,r2,r3,r4,r5) VALUES(?,?,?,?,?,?) ON CONFLICT(route_id) DO UPDATE SET requests=requests+excluded.requests,r2=r2+excluded.r2,r3=r3+excluded.r3,r4=r4+excluded.r4,r5=r5+excluded.r5", id, d.requests, d.r2, d.r3, d.r4, d.r5)
-		if e == nil {
-			minute := now.Unix() / 60 * 60
-			_, e = tx.Exec("INSERT INTO request_samples(route_id,ts,requests,r2,r3,r4,r5) VALUES(?,?,?,?,?,?,?) ON CONFLICT(route_id,ts) DO UPDATE SET requests=requests+excluded.requests,r2=r2+excluded.r2,r3=r3+excluded.r3,r4=r4+excluded.r4,r5=r5+excluded.r5", id, minute, d.requests, d.r2, d.r3, d.r4, d.r5)
-		}
-		if e != nil {
-			tx.Rollback()
-			log.Printf("request stats db: %v", e)
-		} else if e = tx.Commit(); e != nil {
-			log.Printf("request stats commit: %v", e)
+		if d.requests+d.r2+d.r3+d.r4+d.r5 > 0 {
+			deltas[id] = d
 		}
 	}
-	a.lastStats = observed
-	a.lastStatsAt = now
+	a.statsMu.Unlock()
+	if len(deltas) > 0 {
+		tx, err := a.db.Begin()
+		if err != nil {
+			log.Printf("request stats db: %v", err)
+			return
+		}
+		defer tx.Rollback()
+		for id, d := range deltas {
+			_, err = tx.Exec("INSERT INTO request_totals(route_id,requests,r2,r3,r4,r5) VALUES(?,?,?,?,?,?) ON CONFLICT(route_id) DO UPDATE SET requests=requests+excluded.requests,r2=r2+excluded.r2,r3=r3+excluded.r3,r4=r4+excluded.r4,r5=r5+excluded.r5", id, d.requests, d.r2, d.r3, d.r4, d.r5)
+			if err == nil {
+				_, err = tx.Exec("INSERT INTO request_samples(route_id,ts,requests,r2,r3,r4,r5) VALUES(?,?,?,?,?,?,?) ON CONFLICT(route_id,ts) DO UPDATE SET requests=requests+excluded.requests,r2=r2+excluded.r2,r3=r3+excluded.r3,r4=r4+excluded.r4,r5=r5+excluded.r5", id, now.Unix()/60*60, d.requests, d.r2, d.r3, d.r4, d.r5)
+			}
+			if err != nil {
+				log.Printf("request stats db: %v", err)
+				return
+			}
+		}
+		if err = tx.Commit(); err != nil {
+			log.Printf("request stats commit: %v", err)
+			return
+		}
+	}
+	// Only advance the baseline after durable success, so failures are retried.
+	a.lastStats, a.lastStatsAt = observed, now
 }
 func (a *App) requestStatsAPI(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
@@ -157,6 +176,12 @@ func (a *App) requestStatsAPI(w http.ResponseWriter, r *http.Request) {
 			out[v.RouteID] = v
 		}
 	}
+	if err := rows.Err(); err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	// Release the only SQLite connection before acquiring any application lock.
+	_ = rows.Close()
 	a.statsMu.RLock()
 	for id, v := range a.liveStats {
 		item := out[id]
@@ -176,6 +201,7 @@ func (a *App) requestStatsAPI(w http.ResponseWriter, r *http.Request) {
 		list = append(list, v)
 	}
 	a.mu.RUnlock()
+	sort.Slice(list, func(i, j int) bool { return list[i].RouteID < list[j].RouteID })
 	writeJSON(w, 200, list)
 }
 func (a *App) requestHistoryAPI(w http.ResponseWriter, r *http.Request) {

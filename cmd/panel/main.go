@@ -21,10 +21,13 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -64,22 +67,34 @@ type Period struct {
 	Used, Extra                  int64
 	ThresholdSent, ExhaustedSent bool
 }
+type retiredPeriod struct {
+	Period
+	reserved int64
+}
 type RouteState struct {
-	Route                  Route
-	Daily, Monthly         Period
-	mu                     sync.Mutex
-	Listener               net.Listener
-	conns                  map[net.Conn]struct{}
-	upBucket, downBucket   bucket
-	pendingUp, pendingDown int64
-	lastUp, lastDown       int64
-	healthy                bool
-	unhealthySince         time.Time
-	alertSent              bool
+	Route                          Route
+	Daily, Monthly                 Period
+	mu                             sync.Mutex
+	Listener                       net.Listener
+	conns                          map[net.Conn]struct{}
+	upBucket, downBucket           bucket
+	pendingUp, pendingDown         int64
+	lastUp, lastDown               int64
+	healthy                        bool
+	unhealthySince                 time.Time
+	alertSent                      bool
+	reservedDaily, reservedMonthly int64
+	savedDaily, savedMonthly       Period
+	savedUp, savedDown             int64
+	rateUp, rateDown               int64
+	rateAt                         time.Time
+	deleted                        bool
+	retired                        map[string]retiredPeriod
 }
 type bucket struct {
 	tokens float64
 	last   time.Time
+	rate   int64
 }
 type App struct {
 	db                            *sql.DB
@@ -99,6 +114,14 @@ type App struct {
 	financeMu                     sync.Mutex
 	restoreMu                     sync.Mutex
 	start                         time.Time
+	flushInterval                 time.Duration
+	// stateMu serializes control-plane changes and persistence, never relay I/O.
+	stateMu              sync.Mutex
+	collectMu            sync.Mutex
+	closing              atomic.Bool
+	listenersWG, relayWG sync.WaitGroup
+	fallbackListener     net.Listener
+	fallbackConns        sync.Map
 }
 type TelegramSettings struct{ APIURL, BotToken, ChatID string }
 
@@ -114,6 +137,13 @@ func fatal(err error) {
 	}
 }
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == "--healthcheck" {
+		if err := checkPanelHealth(); err != nil {
+			log.Print(err)
+			os.Exit(1)
+		}
+		return
+	}
 	data := env("PANEL_DATA", "./data")
 	fatal(os.MkdirAll(data, 0700))
 	fatal(applyPendingRestore(data))
@@ -141,6 +171,11 @@ func main() {
 	fatal(err)
 	a := &App{db: db, data: data, web: env("PANEL_WEB", "./web/dist"), secretPath: strings.Trim(env("PANEL_SECRET_PATH", "admin"), "/"), domain: strings.ToLower(env("PANEL_DOMAIN", "proxy.local.invalid")), tokenHash: sha256.Sum256([]byte(token)), master: []byte(master), location: loc, routes: map[int64]*RouteState{}, start: time.Now()}
 	a.domain = a.getSetting("domain", a.domain)
+	a.flushInterval, err = time.ParseDuration(env("PANEL_FLUSH_INTERVAL", "5s"))
+	fatal(err)
+	if a.flushInterval < time.Second || a.flushInterval > time.Minute {
+		log.Fatal("PANEL_FLUSH_INTERVAL must be between 1s and 1m")
+	}
 	if !validDomain(a.domain) {
 		log.Fatal("invalid PANEL_DOMAIN")
 	}
@@ -151,14 +186,37 @@ func main() {
 	a.tg = TelegramSettings{APIURL: a.getSetting("tg_api", "https://api.telegram.org"), BotToken: a.decrypt(a.getSetting("tg_token", "")), ChatID: a.getSetting("tg_chat", "")}
 	fatal(a.initFinance())
 	fatal(a.initRequestStats())
+	fatal(a.initHistoryIndexes())
 	a.liveStats = map[int64]RequestStats{}
 	fatal(a.ensureCert("fallback", a.domain))
 	fatal(a.loadRoutes())
 	fatal(a.writeConfig())
 	fatal(a.startListeners())
-	go a.tick()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	tickDone := make(chan struct{})
+	go func() { defer close(tickDone); a.tick(ctx) }()
 	go a.serveFallback()
-	a.serveAdmin()
+	server := a.adminServer()
+	go func() {
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("panel: %v", err)
+			stop()
+		}
+	}()
+	<-ctx.Done()
+	a.closing.Store(true)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		_ = server.Close()
+	}
+	a.stopRelays()
+	<-tickDone
+	if err := a.flushTraffic(time.Now()); err != nil {
+		log.Printf("final traffic flush: %v", err)
+	}
+	fatal(db.Close())
 }
 
 func (a *App) getSetting(k, d string) string {
@@ -266,7 +324,12 @@ func (a *App) loadRoutes() error {
 		return err
 	}
 	for _, s := range loaded {
-		a.refreshPeriods(s, time.Now())
+		if err := a.refreshPeriods(s, time.Now()); err != nil {
+			return err
+		}
+		s.savedUp, s.savedDown = s.Route.UpTotal, s.Route.DownTotal
+		s.savedDaily, s.savedMonthly = s.Daily, s.Monthly
+		s.rateUp, s.rateDown, s.rateAt = s.Route.UpTotal, s.Route.DownTotal, time.Now()
 		a.routes[s.Route.ID] = s
 	}
 	return nil
@@ -293,35 +356,44 @@ func monthAnchor(y int, m time.Month, d int, l *time.Location) time.Time {
 	}
 	return time.Date(first.Year(), first.Month(), d, 0, 0, 0, 0, l)
 }
-func (a *App) loadPeriod(id int64, kind, key string) Period {
+func (a *App) loadPeriod(id int64, kind, key string) (Period, error) {
 	p := Period{Key: key}
 	var t, e int
-	_ = a.db.QueryRow("SELECT used,extra,threshold_sent,exhausted_sent FROM periods WHERE route_id=? AND kind=? AND key=?", id, kind, key).Scan(&p.Used, &p.Extra, &t, &e)
+	err := a.db.QueryRow("SELECT used,extra,threshold_sent,exhausted_sent FROM periods WHERE route_id=? AND kind=? AND key=?", id, kind, key).Scan(&p.Used, &p.Extra, &t, &e)
+	if err != nil && err != sql.ErrNoRows {
+		return Period{}, err
+	}
 	p.ThresholdSent = t != 0
 	p.ExhaustedSent = e != 0
-	return p
+	return p, nil
 }
-func (a *App) refreshPeriods(s *RouteState, now time.Time) bool {
+
+// Only used before a route is published; live rollovers use rollPeriods.
+func (a *App) refreshPeriods(s *RouteState, now time.Time) error {
 	dk := a.periodKey(s.Route, "daily", now)
 	mk := a.periodKey(s.Route, "monthly", now)
-	changed := false
+	var err error
 	if s.Daily.Key != dk {
 		old := s.Daily.Key
-		s.Daily = a.loadPeriod(s.Route.ID, "daily", dk)
-		changed = true
+		s.Daily, err = a.loadPeriod(s.Route.ID, "daily", dk)
+		if err != nil {
+			return err
+		}
 		if old != "" && s.Route.DailyLimit > 0 {
-			a.notify(s.Route, quotaResetMessage("daily", s.Route.DailyLimit+s.Daily.Extra))
+			go a.notify(s.Route, quotaResetMessage("daily", s.Route.DailyLimit+s.Daily.Extra))
 		}
 	}
 	if s.Monthly.Key != mk {
 		old := s.Monthly.Key
-		s.Monthly = a.loadPeriod(s.Route.ID, "monthly", mk)
-		changed = true
+		s.Monthly, err = a.loadPeriod(s.Route.ID, "monthly", mk)
+		if err != nil {
+			return err
+		}
 		if old != "" && s.Route.MonthlyLimit > 0 {
-			a.notify(s.Route, quotaResetMessage("monthly", s.Route.MonthlyLimit+s.Monthly.Extra))
+			go a.notify(s.Route, quotaResetMessage("monthly", s.Route.MonthlyLimit+s.Monthly.Extra))
 		}
 	}
-	return changed
+	return nil
 }
 func (s *RouteState) blocked() bool {
 	r := s.Route
@@ -408,7 +480,8 @@ func (a *App) notify(r Route, msg string) {
 				return
 			}
 			if err != nil {
-				log.Printf("telegram: %v", err)
+				// net/http errors can contain the complete URL and bot token.
+				log.Printf("telegram request failed (%T)", err)
 			} else {
 				log.Printf("telegram: %s", resp.Status)
 			}

@@ -34,6 +34,12 @@ func (a *App) backupAPI(w http.ResponseWriter, r *http.Request) {
 	}
 	a.restoreMu.Lock()
 	defer a.restoreMu.Unlock()
+	if err := a.flushTraffic(time.Now()); err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	a.stateMu.Lock()
+	defer a.stateMu.Unlock()
 	temp, err := os.CreateTemp(a.data, "backup-snapshot-*.db")
 	if err != nil {
 		fail(w, 500, err.Error())

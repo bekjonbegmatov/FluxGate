@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"net/http"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -86,5 +87,21 @@ func (a *App) systemAPI(w http.ResponseWriter, r *http.Request) {
 		fail(w, 405, "method")
 		return
 	}
-	writeJSON(w, 200, readHostStats())
+	stats := readHostStats()
+	stats["uptime_seconds"] = int64(time.Since(a.start).Seconds())
+	stats["goroutines"] = runtime.NumGoroutine()
+	var memory runtime.MemStats
+	runtime.ReadMemStats(&memory)
+	stats["heap_bytes"] = memory.HeapAlloc
+	active := 0
+	for _, s := range a.routeStates() {
+		s.mu.Lock()
+		active += len(s.conns)
+		s.mu.Unlock()
+	}
+	stats["relay_connections"] = active
+	db := a.db.Stats()
+	stats["db_wait_count"] = db.WaitCount
+	stats["db_wait_seconds"] = db.WaitDuration.Seconds()
+	writeJSON(w, 200, stats)
 }
