@@ -19,7 +19,9 @@
 | `cmd/panel/main.go` | Запуск, SQLite, схемы, сессии и сертификаты |
 | `cmd/panel/api.go` | Авторизованный API, CRUD маршрутов, настройки, история |
 | `cmd/panel/config.go` | Генерация и проверка HAProxy config |
-| `cmd/panel/relay.go` | Два relay, квоты, скорость, здоровье, секундный tick |
+| `cmd/panel/relay.go` | Relay, квоты в памяти, скорость, здоровье, lifecycle соединений |
+| `cmd/panel/accounting.go` | Пакетное сохранение без удержания relay mutex, смена периодов |
+| `cmd/panel/health.go` | Готовность SQLite/HAProxy, CLI healthcheck |
 | `cmd/panel/requeststats.go` | HAProxy stats socket, счётчики HTTP и история |
 | `cmd/panel/finance.go` | Аренда, платежи, напоминания |
 | `cmd/panel/export.go` | Авторизованные CSV оплаты и трафика |
@@ -28,6 +30,7 @@
 | `web/src/main.tsx` | React UI, роуты, графики, формы |
 | `web/src/style.css` | Внешний вид и адаптивность |
 | `install.sh` | Установка через Docker на чистый Ubuntu/Debian |
+| `update.sh`, `deploy/update-*` | Обновление Docker с backup, проверкой и откатом образов |
 | `compose.yaml`, `Dockerfile`, `haproxy/` | Два контейнера и общий том `/data` |
 | `deploy/` | Альтернативная нативная установка systemd на текущем VPS |
 
@@ -40,6 +43,8 @@
 5. Выполняйте `go test ./...`, `go vet ./...`, `npm --prefix web run build`, `git diff --check`. При изменениях установщика — `bash -n install.sh`.
 6. На нативном VPS соберите `go build -o /usr/local/bin/fluxgate-panel.new ./cmd/panel`, установите бинарник, скопируйте `web/dist`, перезапустите `fluxgate-panel.service`, проверьте обе службы и HTTP API. Для Docker используйте `docker compose -p fluxgate up -d --build`.
 7. Делайте небольшие осмысленные коммиты. Обновляйте README и документацию при изменении функций или ограничений.
+
+Для изменений relay/accounting выполняйте также `go test -race ./...`. Не удерживайте `RouteState.mu` во время SQL, сетевых операций или ожидания limiter. `stateMu` сериализует изменения маршрутов и persistence; после DB commit вычитайте только сохранённые дельты. Метаданные маршрута нельзя откатывать вместе с накопленными за время запроса байтами. Новые изменения updater проверяйте `python3 deploy/test-update.py`. Полный TLS/reload/quota/restart-тест — `python3 deploy/test-integration.py --seconds 60` в отдельном локальном Docker-проекте.
 
 ## Нетривиальные детали
 

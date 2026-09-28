@@ -1,0 +1,48 @@
+# Isolated, loopback-only integration stack. Never use the production volume.
+services:
+  haproxy:
+    image: fluxgate-test-haproxy
+    build: ../haproxy
+    init: true
+    ports:
+      - "127.0.0.1:19443:443"
+      - "127.0.0.1:19389:9389"
+    volumes:
+      - test-data:/data
+    ulimits:
+      nofile: 262144
+  panel:
+    image: fluxgate-test-panel
+    build: ..
+    init: true
+    network_mode: service:haproxy
+    depends_on: [haproxy]
+    environment:
+      PANEL_DATA: /data
+      PANEL_WEB: /opt/panel/web
+      PANEL_LISTEN: :9389
+      PANEL_SECRET_PATH: admin
+      PANEL_DOMAIN: fallback.example.test
+      PANEL_TOKEN: integration-only-token-not-a-real-secret
+      PANEL_MASTER_KEY: integration-only-key-not-a-real-secret
+      PANEL_FLUSH_INTERVAL: 5s
+    volumes:
+      - test-data:/data
+    stop_grace_period: 45s
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/panel", "--healthcheck"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+    ulimits:
+      nofile: 262144
+  origin:
+    image: node:22-alpine
+    init: true
+    command: ["node", "/test/origin.mjs"]
+    volumes:
+      - ./test-origin.mjs:/test/origin.mjs:ro
+      - ./test-load.mjs:/test/load.mjs:ro
+      - test-data:/data:ro
+volumes:
+  test-data:

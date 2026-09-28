@@ -18,6 +18,7 @@
 | `PANEL_SECRET_PATH` | Стандартно `admin`; для иного пути нужно пересобрать Vite |
 | `PANEL_DOMAIN` | Начальный fallback домен, затем значение из SQLite |
 | `PANEL_TIMEZONE` | Часовой пояс квот и аренды, после restore значение из SQLite |
+| `PANEL_FLUSH_INTERVAL` | Интервал пакетного сохранения трафика: `5s`, допустимо `1s`–`1m` |
 | `PANEL_TOKEN` | Токен входа, минимум 24 символа |
 | `PANEL_MASTER_KEY` | Шифрование Telegram token и подпись сессий, минимум 24 символа |
 
@@ -31,9 +32,29 @@
 
 ## Обновление
 
-Docker: `cd /opt/fluxgate && git pull --ff-only && docker compose -p fluxgate up -d --build`. Нативно: из checkout запустить `sudo bash deploy/install-native.sh`; файл `/etc/fluxgate/fluxgate.env` сохраняется. Перед обновлением схемы базы скачайте backup ZIP. Статистика запросов собирается с момента её включения, а трафик и HTTP сэмплы старше 90 дней удаляются.
+Для Docker-установки из README:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/bekjonbegmatov/FluxGate/main/update.sh -o /tmp/fluxgate-update.sh && sudo bash /tmp/fluxgate-update.sh
+```
+
+`update.sh` блокирует параллельные обновления, проверяет чистоту checkout, скачивает выбранный ref (по умолчанию main) и собирает код во временной папке. `deploy/update-docker.sh` сохраняет ссылки на прежние образы и resolved Compose-конфигурацию, выполняет сборку, затем получает согласованный ZIP через локальный авторизованный API и проверяет целостность архива. В `/var/backups/fluxgate/<дата>` остаются ZIP, `.env`, прежний commit и `rollback.compose.json` (права 0700/0600). Прежние образы сохраняются под тегами `fluxgate-rollback-*`. Секреты не передаются аргументами команд и не печатаются.
+
+После fast-forward обновления checkout пересоздаются **оба** контейнера: панель разделяет network namespace HAProxy и не должна оставаться привязанной к удалённому контейнеру. Проверяются Docker healthcheck, авторизованный API и HTTPS fallback через SNI на 443. При ошибке переключения автоматически запускаются прежние образы. База остаётся текущей — автоматический откат не заменяет её устаревшим backup. В этом обновлении миграции только добавляют индексы и совместимы со старой версией. Checkout при откате может остаться на новом commit; работающие контейнеры используют сохранённые образы.
+
+Ручной откат образов: `sudo docker compose -p fluxgate -f /var/backups/fluxgate/НУЖНАЯ-ДАТА/rollback.compose.json up -d --no-build --pull never --force-recreate`. Восстановление данных из ZIP — отдельная операция через панель. Backup и образы не удаляются автоматически: после проверки установки ненужные старые копии можно удалить вручную.
+
+Обновление предусматривает короткий перерыв и переподключение активных соединений. Параметры: `FLUXGATE_DIR` (checkout), `FLUXGATE_PROJECT` (Compose-проект), `FLUXGATE_REF` (ветка или commit), `FLUXGATE_BACKUP_DIR`. Скрипт рассчитан на стандартный `compose.yaml` из установщика; при неизвестном наборе Compose-файлов в labels контейнеров он останавливается до сборки и переключения. При своих override-файлах/портах сделайте backup и сборку вручную, затем пересоздайте оба сервиса с вашими Compose-параметрами. Нативно: из checkout запустите `sudo bash deploy/install-native.sh`; файл `/etc/fluxgate/fluxgate.env` сохраняется, backup предварительно скачивается через панель.
+
+Статистика запросов собирается с момента её включения, трафик и HTTP-сэмплы старше 90 дней удаляются. После изменения `PANEL_FLUSH_INTERVAL` в `.env` примените среду через `docker compose -p fluxgate up -d --no-deps panel` из checkout; простой `restart` не перечитывает `.env`.
 
 ## Проверки
+
+Дополнительно к базовым проверкам: `go test -race ./...`, `python3 deploy/test-update.py`, `python3 deploy/test-integration.py --seconds 60`. Последняя команда создаёт отдельный Docker-проект `fluxgate-integration-test`, слушает только loopback на 19389/19443 и удаляет только его тестовые контейнеры/том. Не запускайте нагрузочный тест одновременно с реальным трафиком на маленьком VPS.
+
+`curl -fsS http://127.0.0.1:9389/healthz` проверяет SQLite и локальные listeners/сокет HAProxy. В Docker: `docker compose -p fluxgate exec -T panel /usr/local/bin/panel --healthcheck`. При статусе unhealthy сначала смотрите журналы: Docker сам по себе не перезапускает контейнер исключительно по unhealthy; перезапуск настроен на выход процесса. Watcher завершается при падении master, поэтому его автоматически перезапускает Docker/systemd. Оба образа явно используют `STOPSIGNAL SIGTERM`, чтобы панель сохраняла данные при остановке.
+
+Авторизованный `/admin/api/system` показывает `goroutines`, `heap_bytes`, `relay_connections`, `db_wait_count`, `db_wait_seconds`. Сравнивайте их во время нагрузки и после её окончания. `PANEL_FLUSH_INTERVAL` меняет частоту записи, но не точность оперативной квоты или частоту расчёта скорости. На диске остаются только успешно сохранённые данные; продолжительный отказ хранилища увеличивает возможные потери при аварии процесса.
 
 Разработка: `go test ./...`, `go vet ./...`, `npm --prefix web ci`, `npm --prefix web run build`, `bash -n install.sh`. Панель должна отвечать 200 на `/admin/`, а без cookie — 401 на `/admin/api/backup`. С cookie проверьте `/admin/api/routes`, `/admin/api/request-stats`, `/admin/api/backup`. Публичный proxy: `curl -sk --resolve cubeland.top:443:127.0.0.1 https://cubeland.top/`. Проверка `ss -lntp` должна показывать 443 и 9389 на публичных интерфейсах. У облачного провайдера может быть отдельный firewall; разрешите TCP 443/9389 там.
 

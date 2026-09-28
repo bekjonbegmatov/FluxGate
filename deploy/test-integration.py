@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+"""End-to-end checks against an isolated Docker stack on loopback ports.
+
+Run: python3 deploy/test-integration.py [--seconds 30]
+Builds are done before startup. Only this script's test containers/volume are
+removed in finally; production containers and data are never addressed.
+"""
+import argparse
+from concurrent.futures import ThreadPoolExecutor
+import hashlib
+import http.client
+import http.cookiejar
+import json
+import os
+from pathlib import Path
+import socket
+import ssl
+import subprocess
+import time
+import tempfile
+import urllib.request
+import zipfile
+
+ROOT=Path(__file__).resolve().parent.parent
+COMPOSE=["docker","compose","-p","fluxgate-integration-test","-f",str(ROOT/"deploy/compose.test.yaml")]
+TOKEN="integration-only-token-not-a-real-secret"
+opener=urllib.request.build_opener(urllib.request.ProxyHandler({}),urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+
+class TruncatedDownload(Exception): pass
+
+def compose(*args):
+    return subprocess.check_output(COMPOSE+list(args),text=True).strip()
+
+def api(path,method="GET",data=None):
+    request=urllib.request.Request("http://127.0.0.1:19389/admin/api"+path,method=method,data=None if data is None else json.dumps(data).encode(),headers={"Content-Type":"application/json"})
+    with opener.open(request,timeout=20) as response:
+        return json.load(response)
+
+def tls_socket(domain):
+    context=ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname=False
+    context.verify_mode=ssl.CERT_NONE
+    return context.wrap_socket(socket.create_connection(("127.0.0.1",19443),timeout=20),server_hostname=domain)
+
+def download(domain,size=2):
+    with tls_socket(domain) as connection:
+        connection.sendall(f"GET /?size={size} HTTP/1.1\r\nHost: {domain}\r\nConnection: close\r\n\r\n".encode())
+        response=http.client.HTTPResponse(connection)
+        response.begin()
+        count=0
+        while chunk:=response.read(256*1024):
+            count+=len(chunk)
+        if response.status==200 and domain!="fallback.example.test":
+            if count!=size: raise TruncatedDownload((count,size))
+        return response.status,count
+
+def wait_for(fn,timeout=30):
+    end=time.monotonic()+timeout
+    while True:
+        try:
+            result=fn()
+            if result:
+                return result
+        except (OSError,AssertionError,ValueError,http.client.HTTPException,TruncatedDownload):
+            pass
+        if time.monotonic()>end:
+            raise AssertionError("Timed out waiting for test condition")
+        time.sleep(.2)
+
+def config_hash():
+    return compose("exec","-T","panel","sha256sum","/data/haproxy.cfg").split()[0]
+
+def master_command(command):
+    return compose("exec","-T","origin","node","-e","const n=require('net');const c=n.createConnection('/data/haproxy-master.sock',()=>c.write(process.argv[1]+'\\n'));c.on('data',b=>process.stdout.write(b));c.on('end',()=>process.exit());setTimeout(()=>process.exit(),3000)",command)
+
+def route(rid):
+    return next(r for r in api("/routes") if r["id"]==rid)
+
+def update(rid,**changes):
+    r=route(rid)
+    r.update(changes)
+    return api(f"/routes/{rid}","PUT",r)
+
+def main(seconds):
+    compose("build")
+    try:
+        compose("up","-d","--wait","--wait-timeout","120")
+        api("/login","POST",{"token":TOKEN})
+        assert download("fallback.example.test")[0]==200
+        origin=compose("ps","-q","origin")
+        ip=subprocess.check_output(["docker","inspect","--format","{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",origin],text=True).strip()
+        ids=[]
+        for i in range(3):
+            value=api("/routes","POST",dict(name=f"Test {i}",sni=f"route{i}.example.test",ip=ip,port=8080,tls=False,verify=False,verify_name="",paused=False,daily_limit=0,monthly_limit=0,count_mode="both",down_bps=0,up_bps=0,threshold=80,monitor=False))
+            ids.append(value["id"])
+        wait_for(lambda:download("route0.example.test")[0]==200)
+        for _ in range(25):
+            assert [r["id"] for r in api("/routes")]==sorted(ids)
+        initial_hash=config_hash()
+        update(ids[0],name="Renamed",down_bps=0)
+        assert config_hash()==initial_hash,"metadata triggered a reload"
+        print("PASS: routing, stable order, deterministic/no-op config",flush=True)
+
+        tunnel=tls_socket("route0.example.test")
+        tunnel.sendall(b"GET /tunnel HTTP/1.1\r\nHost: route0.example.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n")
+        headers=b""
+        while b"\r\n\r\n" not in headers:
+            headers+=tunnel.recv(1024)
+        assert headers.startswith(b"HTTP/1.1 101"),headers
+        for i in range(4):
+            domain=f"changed{i}.example.test"
+            update(ids[1],sni=domain)
+            wait_for(lambda:download(domain)[0]==200)
+            tunnel.sendall(b"still alive")
+            assert tunnel.recv(11)==b"still alive"
+        print("PASS: upgraded tunnel survives four actual HAProxy reloads",flush=True)
+        update(ids[0],paused=True)
+        assert download("route0.example.test")[0]==503
+        try:
+            assert tunnel.recv(1)==b""
+        except (OSError,ssl.SSLError):
+            pass
+        tunnel.close()
+        update(ids[0],paused=False)
+        assert download("route0.example.test")[0]==200
+        # Old workers may still be finishing HTTP keep-alive/half-close timers.
+        print(master_command("show proc"),flush=True)
+        try:
+            wait_for(lambda:sum(p.strip()=="haproxy" for p in compose("exec","-T","haproxy","ps","-o","comm").splitlines())==2,40)
+        except AssertionError:
+            procs=master_command("show proc")
+            print(procs,flush=True)
+            for line in procs.splitlines():
+                values=line.split()
+                if values and values[0].isdigit() and "worker" in line:
+                    print(master_command("@!"+values[0]+" show sess"),flush=True)
+            print(json.dumps(api('/system')),flush=True)
+            raise
+        print("PASS: pause closes active tunnel, resume works, old workers reaped",flush=True)
+
+        update(ids[2],daily_limit=256*1024)
+        quota_hash=config_hash()
+        try:
+            download("route2.example.test",1024*1024)
+            raise AssertionError("Quota allowed the entire download")
+        except (OSError,http.client.HTTPException,TruncatedDownload):
+            pass
+        assert download("route2.example.test")[0]==429
+        api(f"/routes/{ids[2]}/topup","POST",{"kind":"daily","bytes":2*1024*1024})
+        assert download("route2.example.test")[0]==200
+        assert config_hash()==quota_hash,"quota changed HAProxy config"
+        print("PASS: quotas/429/topup, no unmetered window or quota reload",flush=True)
+
+        update(ids[0],down_bps=128*1024)
+        start=time.monotonic()
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            results=list(pool.map(lambda _:download("route0.example.test",64*1024),range(4)))
+        elapsed=time.monotonic()-start
+        assert all(status==200 for status,_ in results) and elapsed>=.85,elapsed
+        update(ids[0],down_bps=0)
+        print(f"PASS: four streams share one rate limit ({elapsed:.2f}s)",flush=True)
+
+        before=route(ids[0])["down_total"]
+        assert download("route0.example.test",1024*1024)[0]==200
+        compose("restart","-t","45","panel")
+        wait_for(lambda:download("route0.example.test")[0]==200)
+        assert route(ids[0])["down_total"]>=before+1024*1024
+        print("PASS: graceful restart flushes counters and preserves config",flush=True)
+
+        with tempfile.TemporaryDirectory(prefix='fluxgate-backup-test-') as directory:
+            archive=Path(directory)/'panel.zip'
+            env=dict(os.environ,FLUXGATE_PANEL_URL='http://127.0.0.1:19389')
+            subprocess.run(['python3',str(ROOT/'deploy/update-helper.py'),'backup',str(archive)],input=json.dumps(['PANEL_TOKEN='+TOKEN,'PANEL_SECRET_PATH=admin']),env=env,text=True,check=True)
+            with zipfile.ZipFile(archive) as saved:
+                assert 'panel.db' in saved.namelist() and saved.testzip() is None
+        print("PASS: updater creates a validated live backup using existing credentials",flush=True)
+
+        process=subprocess.Popen(COMPOSE+["exec","-T","origin","node","/test/load.mjs",str(seconds),"4"],stdout=subprocess.PIPE,text=True)
+        for line in process.stdout:
+            print(line.rstrip(),flush=True)
+        assert process.wait()==0,"Linux TLS load test failed"
+        wait_for(lambda:api("/system")["relay_connections"]==0)
+        print("PASS: sustained traffic, no remaining route connections",flush=True)
+        stats=api('/system')
+        print(json.dumps({"system":{k:stats.get(k) for k in ['goroutines','heap_bytes','relay_connections','db_wait_count','db_wait_seconds']}},indent=2))
+    finally:
+        print(compose("logs","--tail","8"))
+        compose("down","-v","--timeout","45")
+
+if __name__=="__main__":
+    parser=argparse.ArgumentParser()
+    parser.add_argument("--seconds",type=int,default=30)
+    main(parser.parse_args().seconds)

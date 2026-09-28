@@ -14,6 +14,13 @@ if [[ ${ID:-} != ubuntu && ${ID:-} != debian ]]; then echo 'Supported systems: U
 if [[ -z ${VERSION_CODENAME:-} ]]; then echo 'VERSION_CODENAME is missing' >&2; exit 1; fi
 if [[ ! $domain =~ ^[A-Za-z0-9.-]+$ || $domain != *.* ]]; then echo 'Invalid FLUXGATE_DOMAIN' >&2; exit 1; fi
 export DEBIAN_FRONTEND=noninteractive
+if [[ -d "$install_dir/.git" && -f "$install_dir/.env" ]]; then
+  updater=$(mktemp /tmp/fluxgate-update.XXXXXXXX.sh)
+  trap 'rm -f -- "$updater"' EXIT
+  curl -fsSL https://raw.githubusercontent.com/bekjonbegmatov/FluxGate/main/update.sh -o "$updater"
+  bash "$updater"
+  exit
+fi
 apt-get update -qq
 apt-get install -y -qq ca-certificates curl git openssl
 if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
@@ -59,7 +66,7 @@ fi
 chmod 600 .env
 secret_path=$(sed -n 's/^PANEL_SECRET_PATH=//p' .env | head -n 1)
 if [[ -z $secret_path ]]; then secret_path=admin; fi
-docker compose -p fluxgate up -d --build
+docker compose -p fluxgate up -d --build --wait --wait-timeout 120
 ready=0
 for ((attempt=0; attempt<90; attempt++)); do
   if [[ $(curl -sS -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:9389/${secret_path}/" 2>/dev/null || true) == 200 ]]; then ready=1; break; fi
