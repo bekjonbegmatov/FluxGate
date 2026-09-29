@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"net/http"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -93,13 +94,42 @@ func (a *App) systemAPI(w http.ResponseWriter, r *http.Request) {
 	var memory runtime.MemStats
 	runtime.ReadMemStats(&memory)
 	stats["heap_bytes"] = memory.HeapAlloc
-	active := 0
+	active, paused, quota := 0, 0, 0
+	var pending int64
 	for _, s := range a.routeStates() {
 		s.mu.Lock()
 		active += len(s.conns)
+		pending += s.pendingUp + s.pendingDown
+		if s.Route.Paused {
+			paused++
+		}
+		if s.blocked() {
+			quota++
+		}
 		s.mu.Unlock()
 	}
 	stats["relay_connections"] = active
+	stats["relay_buffer_bytes"] = active * 2 * relayBufferSize
+	stats["paused_routes"], stats["quota_routes"] = paused, quota
+	stats["traffic_unsaved_bytes"] = pending
+	stats["traffic_flush_last_ok_unix"] = a.flushLastOK.Load()
+	stats["traffic_flush_last_ms"] = float64(a.flushLastNS.Load()) / 1e6
+	stats["traffic_flush_errors"] = a.flushErrors.Load()
+	stats["max_client_connections"] = a.maxConnections
+	for _, name := range []string{"panel.db", "panel.db-wal", "panel.db-shm"} {
+		if f, err := os.Stat(filepath.Join(a.data, name)); err == nil {
+			stats[name+"_bytes"] = f.Size()
+		}
+	}
+	if b, err := os.ReadFile("/proc/self/status"); err == nil {
+		for _, line := range strings.Split(string(b), "\n") {
+			f := strings.Fields(line)
+			if len(f) >= 2 && (f[0] == "VmRSS:" || f[0] == "VmSwap:") {
+				n, _ := strconv.ParseInt(f[1], 10, 64)
+				stats[strings.TrimSuffix(f[0], ":")+"_bytes"] = n * 1024
+			}
+		}
+	}
 	db := a.db.Stats()
 	stats["db_wait_count"] = db.WaitCount
 	stats["db_wait_seconds"] = db.WaitDuration.Seconds()

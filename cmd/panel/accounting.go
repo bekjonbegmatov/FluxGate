@@ -1,10 +1,40 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"strings"
 	"time"
 )
+
+// Keep the existing 90-day retention, but never delete an arbitrarily large
+// backlog in one write transaction (which can pin SQLite and inflate WAL).
+func (a *App) pruneHistory(ctx context.Context, now time.Time) error {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	for _, table := range []string{"samples", "request_samples"} {
+		for batch := 0; batch < 8; batch++ {
+			if ctx.Err() != nil {
+				return nil
+			} // Continue backlog at the next tick.
+			result, err := a.db.ExecContext(ctx, "DELETE FROM "+table+" WHERE rowid IN (SELECT rowid FROM "+table+" WHERE ts<? ORDER BY ts LIMIT 5000)", now.AddDate(0, 0, -90).Unix())
+			if err != nil {
+				if ctx.Err() != nil {
+					return nil
+				}
+				return err
+			}
+			n, err := result.RowsAffected()
+			if err != nil {
+				return err
+			}
+			if n < 5000 {
+				break
+			}
+		}
+	}
+	return nil
+}
 
 func (a *App) initHistoryIndexes() error {
 	_, err := a.db.Exec(`CREATE INDEX IF NOT EXISTS samples_ts ON samples(ts);
@@ -20,7 +50,16 @@ ON CONFLICT(route_id,kind,key) DO UPDATE SET used=excluded.used,extra=excluded.e
 
 // No route mutex is held while waiting for SQLite. In particular, backups and
 // slow disks must not stall the network. One transaction covers the whole tick.
-func (a *App) flushTraffic(now time.Time) error {
+func (a *App) flushTraffic(now time.Time) (result error) {
+	started := time.Now()
+	defer func() {
+		a.flushLastNS.Store(time.Since(started).Nanoseconds())
+		if result != nil {
+			a.flushErrors.Add(1)
+		} else {
+			a.flushLastOK.Store(time.Now().Unix())
+		}
+	}()
 	a.stateMu.Lock()
 	defer a.stateMu.Unlock()
 	type snapshot struct {

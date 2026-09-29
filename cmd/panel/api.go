@@ -244,27 +244,24 @@ func (a *App) createRoute(w http.ResponseWriter, v Route) {
 	// Read-only counters in a POST are never accepted as initial usage.
 	v.UpTotal, v.DownTotal = 0, 0
 	v.CreatedAt = time.Now().Unix()
-	a.mu.Lock()
 	result, e := a.db.Exec("INSERT INTO routes(name,sni,ip,port,tls,verify,verify_name,paused,daily_limit,monthly_limit,count_mode,down_bps,up_bps,threshold,created_at,monitor) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", v.Name, v.SNI, v.IP, v.Port, boolInt(v.TLS), boolInt(v.Verify), v.VerifyName, boolInt(v.Paused), v.DailyLimit, v.MonthlyLimit, v.CountMode, v.DownBPS, v.UpBPS, v.Threshold, v.CreatedAt, boolInt(v.Monitor))
 	if e != nil {
-		a.mu.Unlock()
 		fail(w, 409, e.Error())
 		return
 	}
 	v.ID, _ = result.LastInsertId()
 	if v.ID > 55535 {
 		_, _ = a.db.Exec("DELETE FROM routes WHERE id=?", v.ID)
-		a.mu.Unlock()
 		fail(w, 400, "too many routes")
 		return
 	}
 	s := &RouteState{Route: v, conns: map[net.Conn]struct{}{}}
 	if e = a.refreshPeriods(s, time.Now()); e != nil {
 		_, _ = a.db.Exec("DELETE FROM routes WHERE id=?", v.ID)
-		a.mu.Unlock()
 		fail(w, 500, e.Error())
 		return
 	}
+	a.mu.Lock()
 	a.routes[v.ID] = s
 	a.mu.Unlock()
 	if e = a.ensureCert(routeCert(v), v.SNI); e == nil {
@@ -284,6 +281,7 @@ func (a *App) createRoute(w http.ResponseWriter, v Route) {
 		fail(w, 500, e.Error())
 		return
 	}
+	a.historyEpoch.Add(1)
 	writeJSON(w, 201, v)
 }
 func (a *App) routeAPI(w http.ResponseWriter, r *http.Request) {
@@ -416,6 +414,7 @@ func (a *App) routeAPI(w http.ResponseWriter, r *http.Request) {
 		}
 		s.mu.Unlock()
 		a.closeRouteConns(s)
+		a.historyEpoch.Add(1)
 		delete(a.lastStats, id)
 		a.statsMu.Lock()
 		delete(a.liveStats, id)
@@ -617,10 +616,10 @@ func (a *App) historyAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	hours := 24
-	since := time.Now().Add(-24 * time.Hour).Unix()
+	since := time.Now().Truncate(time.Minute).Add(-24 * time.Hour).Unix()
 	if n, e := strconv.Atoi(r.URL.Query().Get("hours")); e == nil && n >= 1 && n <= 2160 {
 		hours = n
-		since = time.Now().Add(-time.Duration(n) * time.Hour).Unix()
+		since = time.Now().Truncate(time.Minute).Add(-time.Duration(n) * time.Hour).Unix()
 	}
 	bucket := int64(hours * 3600 / 60)
 	if bucket < 60 {
@@ -632,18 +631,10 @@ func (a *App) historyAPI(w http.ResponseWriter, r *http.Request) {
 		query = "SELECT (ts / ?) * ?, SUM(up), SUM(down) FROM samples WHERE ts>=? GROUP BY 1 ORDER BY 1"
 		args = []any{bucket, bucket, since}
 	}
-	rows, e := a.db.Query(query, args...)
+	out, e := a.historyRows(r.Context(), fmt.Sprintf("traffic/%s/%d/%d", part, hours, since), query, args, 3)
 	if e != nil {
 		fail(w, 500, e.Error())
 		return
-	}
-	defer rows.Close()
-	out := [][3]int64{}
-	for rows.Next() {
-		var t, u, d int64
-		if rows.Scan(&t, &u, &d) == nil {
-			out = append(out, [3]int64{t, u, d})
-		}
 	}
 	writeJSON(w, 200, out)
 }

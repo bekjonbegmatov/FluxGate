@@ -3,6 +3,7 @@ package main
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"crypto"
 	"crypto/x509"
 	"database/sql"
@@ -34,40 +35,62 @@ func (a *App) backupAPI(w http.ResponseWriter, r *http.Request) {
 	}
 	a.restoreMu.Lock()
 	defer a.restoreMu.Unlock()
-	if err := a.flushTraffic(time.Now()); err != nil {
-		fail(w, 500, err.Error())
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
+	defer cancel()
+	archiveFile, err := os.CreateTemp(a.data, "backup-download-*.zip")
+	if err != nil {
+		fail(w, 500, "cannot create backup")
 		return
+	}
+	defer os.Remove(archiveFile.Name())
+	defer archiveFile.Close()
+	if err = a.writeBackup(ctx, archiveFile); err != nil {
+		fail(w, 500, "backup could not be completed")
+		log.Printf("backup archive: %v", err)
+		return
+	}
+	if _, err = archiveFile.Seek(0, 0); err != nil {
+		fail(w, 500, "cannot read backup")
+		return
+	}
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", `attachment; filename="fluxgate-backup.zip"`)
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(5 * time.Minute))
+	http.ServeContent(w, r, "fluxgate-backup.zip", time.Time{}, archiveFile)
+}
+
+// Snapshot and compress to a private file, then release stateMu BEFORE sending
+// to the network. Slow backup downloads must not stop accounting or rollover.
+func (a *App) writeBackup(ctx context.Context, dst io.Writer) error {
+	if err := a.flushTraffic(time.Now()); err != nil {
+		return err
 	}
 	a.stateMu.Lock()
 	defer a.stateMu.Unlock()
 	temp, err := os.CreateTemp(a.data, "backup-snapshot-*.db")
 	if err != nil {
-		fail(w, 500, err.Error())
-		return
+		return err
 	}
 	snapshot := temp.Name()
 	temp.Close()
 	os.Remove(snapshot)
 	defer os.Remove(snapshot)
-	if _, err = a.db.Exec("VACUUM INTO ?", snapshot); err != nil {
-		fail(w, 500, err.Error())
-		return
+	if _, err = a.db.ExecContext(ctx, "VACUUM INTO ?", snapshot); err != nil {
+		return err
 	}
 	_ = os.Chmod(snapshot, 0600)
 	a.mu.RLock()
 	manifest := backupManifest{Version: 1, CreatedAt: time.Now().UTC().Format(time.RFC3339), Domain: a.domain, Timezone: a.location.String(), TelegramToken: a.tg.BotToken}
 	a.mu.RUnlock()
-	w.Header().Set("Content-Type", "application/zip")
-	w.Header().Set("Content-Disposition", `attachment; filename="fluxgate-backup.zip"`)
-	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	archive := zip.NewWriter(w)
+	archive := zip.NewWriter(dst)
 	write := func(name string, src io.Reader) error {
 		entry, e := archive.Create(name)
 		if e != nil {
 			return e
 		}
-		_, e = io.Copy(entry, src)
+		_, e = io.Copy(entry, contextReader{ctx, src})
 		return e
 	}
 	manifestJSON, _ := json.Marshal(manifest)
@@ -97,9 +120,19 @@ func (a *App) backupAPI(w http.ResponseWriter, r *http.Request) {
 	if closeErr := archive.Close(); err == nil {
 		err = closeErr
 	}
-	if err != nil {
-		log.Printf("backup archive: %v", err)
+	return err
+}
+
+type contextReader struct {
+	ctx context.Context
+	io.Reader
+}
+
+func (r contextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
 	}
+	return r.Reader.Read(p)
 }
 func safeCertName(name string) bool {
 	return regexp.MustCompile(`^[A-Za-z0-9_-]+\.pem$`).MatchString(name)

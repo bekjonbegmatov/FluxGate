@@ -15,7 +15,9 @@ import (
 	"time"
 )
 
-const relayBufferSize = 64 * 1024
+// Each tunnel holds TWO buffers even when idle. Keep the per-connection
+// footprint bounded; 10,000 tunnels used to pin 1.22 GiB in 64 KiB buffers.
+const relayBufferSize = 16 * 1024
 const relayIdleTimeout = time.Hour
 
 var relayBuffers = sync.Pool{New: func() any { b := make([]byte, relayBufferSize); return &b }}
@@ -441,11 +443,9 @@ func (a *App) tick(ctx context.Context) {
 		}
 		wg.Wait()
 	})
-	run(time.Hour, func(now time.Time) {
-		for _, table := range []string{"samples", "request_samples"} {
-			if _, err := a.db.Exec("DELETE FROM "+table+" WHERE ts<?", now.AddDate(0, 0, -90).Unix()); err != nil {
-				log.Printf("history cleanup: %v", err)
-			}
+	run(time.Minute, func(now time.Time) {
+		if err := a.pruneHistory(ctx, now); err != nil {
+			log.Printf("history cleanup: %v", err)
 		}
 	})
 	t := time.NewTicker(time.Second)

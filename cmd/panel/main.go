@@ -24,6 +24,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -115,6 +116,7 @@ type App struct {
 	restoreMu                     sync.Mutex
 	start                         time.Time
 	flushInterval                 time.Duration
+	maxConnections                int
 	// stateMu serializes control-plane changes and persistence, never relay I/O.
 	stateMu              sync.Mutex
 	collectMu            sync.Mutex
@@ -122,6 +124,12 @@ type App struct {
 	listenersWG, relayWG sync.WaitGroup
 	fallbackListener     net.Listener
 	fallbackConns        sync.Map
+	exportBusy           atomic.Bool
+	history              historyCache
+	historyEpoch         atomic.Uint64
+	flushLastOK          atomic.Int64
+	flushLastNS          atomic.Int64
+	flushErrors          atomic.Uint64
 }
 type TelegramSettings struct{ APIURL, BotToken, ChatID string }
 
@@ -137,12 +145,22 @@ func fatal(err error) {
 	}
 }
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == "--diagnose" {
+		if err := printDiagnostics(os.Stdout); err != nil {
+			log.Print(err)
+			os.Exit(1)
+		}
+		return
+	}
 	if len(os.Args) == 2 && os.Args[1] == "--healthcheck" {
 		if err := checkPanelHealth(); err != nil {
 			log.Print(err)
 			os.Exit(1)
 		}
 		return
+	}
+	if len(os.Args) != 1 {
+		log.Fatal("supported options: --healthcheck, --diagnose")
 	}
 	data := env("PANEL_DATA", "./data")
 	fatal(os.MkdirAll(data, 0700))
@@ -175,6 +193,11 @@ func main() {
 	fatal(err)
 	if a.flushInterval < time.Second || a.flushInterval > time.Minute {
 		log.Fatal("PANEL_FLUSH_INTERVAL must be between 1s and 1m")
+	}
+	a.maxConnections, err = strconv.Atoi(env("PANEL_MAX_CONNECTIONS", "10000"))
+	fatal(err)
+	if a.maxConnections < 1 || a.maxConnections > 20000 {
+		log.Fatal("PANEL_MAX_CONNECTIONS must be between 1 and 20000")
 	}
 	if !validDomain(a.domain) {
 		log.Fatal("invalid PANEL_DOMAIN")

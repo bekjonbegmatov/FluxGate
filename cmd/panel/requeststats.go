@@ -163,7 +163,7 @@ func (a *App) requestStatsAPI(w http.ResponseWriter, r *http.Request) {
 		fail(w, 405, "method")
 		return
 	}
-	rows, e := a.db.Query("SELECT route_id,requests,r2,r3,r4,r5 FROM request_totals")
+	rows, e := a.db.QueryContext(r.Context(), "SELECT route_id,requests,r2,r3,r4,r5 FROM request_totals")
 	if e != nil {
 		fail(w, 500, e.Error())
 		return
@@ -223,25 +223,17 @@ func (a *App) requestHistoryAPI(w http.ResponseWriter, r *http.Request) {
 	if bucket < 60 {
 		bucket = 60
 	}
-	since := time.Now().Add(-time.Duration(hours) * time.Hour).Unix()
+	since := time.Now().Truncate(time.Minute).Add(-time.Duration(hours) * time.Hour).Unix()
 	query := "SELECT (ts/?)*?,SUM(requests),SUM(r2),SUM(r3),SUM(r4),SUM(r5) FROM request_samples WHERE route_id=? AND ts>=? GROUP BY 1 ORDER BY 1"
 	args := []any{bucket, bucket, id, since}
 	if part == "all" {
 		query = "SELECT (ts/?)*?,SUM(requests),SUM(r2),SUM(r3),SUM(r4),SUM(r5) FROM request_samples WHERE ts>=? GROUP BY 1 ORDER BY 1"
 		args = []any{bucket, bucket, since}
 	}
-	rows, e := a.db.Query(query, args...)
+	out, e := a.historyRows(r.Context(), fmt.Sprintf("requests/%s/%d/%d", part, hours, since), query, args, 6)
 	if e != nil {
 		fail(w, 500, e.Error())
 		return
-	}
-	defer rows.Close()
-	out := [][6]int64{}
-	for rows.Next() {
-		var item [6]int64
-		if rows.Scan(&item[0], &item[1], &item[2], &item[3], &item[4], &item[5]) == nil {
-			out = append(out, item)
-		}
 	}
 	writeJSON(w, 200, out)
 }

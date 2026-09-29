@@ -52,9 +52,17 @@ func (a *App) writeConfig() error {
 	if a.data != "/data" {
 		socketGroup = " group fluxgate"
 	}
-	fmt.Fprintln(&b, "global\n  maxconn 20000\n  hard-stop-after 1h\n  stats socket "+filepath.Join(a.data, "haproxy.sock")+" mode 660"+socketGroup+" level admin expose-fd listeners\n  tune.ssl.default-dh-param 2048\n  ssl-default-bind-options ssl-min-ver TLSv1.2")
+	publicLimit := a.maxConnections
+	if publicLimit == 0 {
+		publicLimit = 10000
+	}
+	reserve := max(8, min(256, publicLimit/10))
+	// Every client consumes an outer AND an inner HAProxy session. Without an
+	// outer cap, pending TLS handshakes can consume every global slot and prevent
+	// their own inner frontend from accepting, while CPU remains mostly idle.
+	fmt.Fprintf(&b, "global\n  maxconn %d\n  hard-stop-after 1h\n  stats socket "+filepath.Join(a.data, "haproxy.sock")+" mode 660"+socketGroup+" level admin expose-fd listeners\n  tune.ssl.default-dh-param 2048\n  ssl-default-bind-options ssl-min-ver TLSv1.2\n", 2*publicLimit+reserve)
 	fmt.Fprintln(&b, "defaults\n  mode http\n  timeout connect 5s\n  timeout client 1h\n  timeout server 1h\n  timeout tunnel 1h\n  timeout http-request 15s\n  timeout http-keep-alive 30s\n  timeout queue 10s\n  timeout client-fin 30s\n  timeout server-fin 30s\n  option clitcpka\n  option srvtcpka")
-	fmt.Fprintln(&b, "frontend public_sni\n  mode tcp\n  bind :443\n  tcp-request inspect-delay 5s\n  tcp-request content accept if { req.ssl_hello_type 1 }")
+	fmt.Fprintf(&b, "frontend public_sni\n  mode tcp\n  maxconn %d\n  bind :443\n  tcp-request inspect-delay 5s\n  tcp-request content accept if { req.ssl_hello_type 1 }\n  tcp-request content reject if WAIT_END\n", publicLimit)
 	fmt.Fprintf(&b, "  acl primary req.ssl_sni -i %s\n  use_backend relay_fallback if primary\n", domain)
 	for _, r := range routes {
 		fmt.Fprintf(&b, "  acl sni_%d req.ssl_sni %s\n", r.ID, aclPattern(r.SNI))
@@ -67,7 +75,7 @@ func (a *App) writeConfig() error {
 	for _, r := range routes {
 		fmt.Fprintf(&b, "backend relay_%d\n  mode tcp\n  server relay 127.0.0.1:%d\n", r.ID, 10000+r.ID)
 	}
-	fmt.Fprintf(&b, "frontend internal_tls\n  mode http\n  bind 127.0.0.1:8443 ssl crt %s", filepath.Join(a.data, "certs", "fallback.pem"))
+	fmt.Fprintf(&b, "frontend internal_tls\n  mode http\n  maxconn %d\n  timeout client 30s\n  bind 127.0.0.1:8443 ssl crt %s", publicLimit+reserve, filepath.Join(a.data, "certs", "fallback.pem"))
 	for _, r := range routes {
 		fmt.Fprintf(&b, " crt %s", filepath.Join(a.data, "certs", routeCert(r)+".pem"))
 	}

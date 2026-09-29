@@ -1,9 +1,12 @@
 package main
 
 import (
+	"context"
+	"database/sql"
 	"encoding/csv"
 	"fmt"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -46,12 +49,66 @@ func exportRouteID(r *http.Request) (int64, error) {
 	}
 	return id, nil
 }
-func startCSV(w http.ResponseWriter, name string) *csv.Writer {
+
+// Materialize on disk before sending any bytes to the client. Otherwise a slow
+// recipient keeps rows open and monopolizes the single SQLite connection.
+func (a *App) exportCSV(w http.ResponseWriter, r *http.Request, name, query string, args []any, header []string, record func(*sql.Rows) ([]string, error)) {
+	if !a.exportBusy.CompareAndSwap(false, true) {
+		w.Header().Set("Retry-After", "5")
+		fail(w, 503, "another export is in progress")
+		return
+	}
+	defer a.exportBusy.Store(false)
+	f, err := os.CreateTemp(a.data, "export-*.csv")
+	if err != nil {
+		fail(w, 500, "cannot create export")
+		return
+	}
+	defer os.Remove(f.Name())
+	defer f.Close()
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	err = func() error {
+		rows, err := a.db.QueryContext(ctx, query, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		if _, err := f.Write([]byte{0xef, 0xbb, 0xbf}); err != nil {
+			return err
+		}
+		csvw := csv.NewWriter(f)
+		if err := csvw.Write(header); err != nil {
+			return err
+		}
+		for rows.Next() {
+			line, err := record(rows)
+			if err != nil {
+				return err
+			}
+			if err := csvw.Write(line); err != nil {
+				return err
+			}
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		csvw.Flush()
+		return csvw.Error()
+	}()
+	if err != nil {
+		fail(w, 500, "export could not be completed")
+		return
+	}
+	if _, err = f.Seek(0, 0); err != nil {
+		fail(w, 500, "cannot read export")
+		return
+	}
 	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, name))
 	w.Header().Set("Cache-Control", "no-store")
-	_, _ = w.Write([]byte{0xef, 0xbb, 0xbf})
-	return csv.NewWriter(w)
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(2 * time.Minute))
+	http.ServeContent(w, r, name, time.Time{}, f)
 }
 func (a *App) exportPaymentsAPI(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
@@ -75,23 +132,14 @@ func (a *App) exportPaymentsAPI(w http.ResponseWriter, r *http.Request) {
 		args = append(args, id)
 	}
 	query += " ORDER BY p.created_at,p.id"
-	rows, e := a.db.Query(query, args...)
-	if e != nil {
-		fail(w, 500, e.Error())
-		return
-	}
-	defer rows.Close()
-	csvw := startCSV(w, "fluxgate-payments.csv")
-	_ = csvw.Write([]string{"Дата оплаты", "ID сервера", "Сервер", "SNI", "Арендатор", "Контакт", "Получено USD", "Оплачено до", "Примечание"})
-	for rows.Next() {
+	a.exportCSV(w, r, "fluxgate-payments.csv", query, args, []string{"Дата оплаты", "ID сервера", "Сервер", "SNI", "Арендатор", "Контакт", "Получено USD", "Оплачено до", "Примечание"}, func(rows *sql.Rows) ([]string, error) {
 		var ts, routeID, amount int64
 		var name, sni, client, contact, paidUntil, note string
-		if rows.Scan(&ts, &routeID, &name, &sni, &client, &contact, &amount, &paidUntil, &note) != nil {
-			continue
+		if err := rows.Scan(&ts, &routeID, &name, &sni, &client, &contact, &amount, &paidUntil, &note); err != nil {
+			return nil, err
 		}
-		_ = csvw.Write([]string{time.Unix(ts, 0).In(a.location).Format("2006-01-02 15:04:05"), strconv.FormatInt(routeID, 10), csvSafe(name), csvSafe(sni), csvSafe(client), csvSafe(contact), fmt.Sprintf("%.2f", float64(amount)/100), paidUntil, csvSafe(note)})
-	}
-	csvw.Flush()
+		return []string{time.Unix(ts, 0).In(a.location).Format("2006-01-02 15:04:05"), strconv.FormatInt(routeID, 10), csvSafe(name), csvSafe(sni), csvSafe(client), csvSafe(contact), fmt.Sprintf("%.2f", float64(amount)/100), paidUntil, csvSafe(note)}, nil
+	})
 }
 func (a *App) exportTrafficAPI(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
@@ -128,25 +176,16 @@ func (a *App) exportTrafficAPI(w http.ResponseWriter, r *http.Request) {
 		args = append(args, id)
 	}
 	query += " GROUP BY 1,s.route_id ORDER BY 1,s.route_id"
-	rows, e := a.db.Query(query, args...)
-	if e != nil {
-		fail(w, 500, e.Error())
-		return
-	}
-	defer rows.Close()
-	csvw := startCSV(w, "fluxgate-traffic.csv")
-	_ = csvw.Write([]string{"Период UTC", "ID сервера", "Сервер", "SNI", "Приём байт", "Отдача байт", "Всего байт"})
-	for rows.Next() {
+	a.exportCSV(w, r, "fluxgate-traffic.csv", query, args, []string{"Период UTC", "ID сервера", "Сервер", "SNI", "Приём байт", "Отдача байт", "Всего байт"}, func(rows *sql.Rows) ([]string, error) {
 		var ts, routeID, up, down int64
 		var name, sni string
-		if rows.Scan(&ts, &routeID, &name, &sni, &up, &down) != nil {
-			continue
+		if err := rows.Scan(&ts, &routeID, &name, &sni, &up, &down); err != nil {
+			return nil, err
 		}
 		stamp := time.Unix(ts, 0).UTC().Format("2006-01-02")
 		if period == "hour" {
 			stamp = time.Unix(ts, 0).UTC().Format("2006-01-02 15:00")
 		}
-		_ = csvw.Write([]string{stamp, strconv.FormatInt(routeID, 10), csvSafe(name), csvSafe(sni), strconv.FormatInt(up, 10), strconv.FormatInt(down, 10), strconv.FormatInt(up+down, 10)})
-	}
-	csvw.Flush()
+		return []string{stamp, strconv.FormatInt(routeID, 10), csvSafe(name), csvSafe(sni), strconv.FormatInt(up, 10), strconv.FormatInt(down, 10), strconv.FormatInt(up+down, 10)}, nil
+	})
 }
