@@ -10,9 +10,40 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
+
+func supportsDirectVersion(output string) bool {
+	fields := strings.Fields(output)
+	if len(fields) < 3 || fields[0] != "HAProxy" || fields[1] != "version" {
+		return false
+	}
+	parts := strings.Split(fields[2], ".")
+	if len(parts) < 2 {
+		return false
+	}
+	major, e1 := strconv.Atoi(parts[0])
+	minor, e2 := strconv.Atoi(parts[1])
+	return e1 == nil && e2 == nil && (major > 3 || major == 3 && minor >= 2)
+}
+
+// Also check at startup/restore: those paths do not pass through the settings
+// Runtime API preflight. Standard Docker/native deployments install this binary.
+func checkDirectHAProxyVersion() error {
+	path, err := exec.LookPath("haproxy")
+	if err != nil {
+		return nil // same optional local validator as writeConfig (unit/dev builds)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, path, "-v").CombinedOutput()
+	if err != nil || !supportsDirectVersion(string(out)) {
+		return fmt.Errorf("direct mode requires HAProxy 3.2 or newer")
+	}
+	return nil
+}
 
 func routeCert(r Route) string {
 	h := sha256.Sum256([]byte(r.SNI))
@@ -29,6 +60,7 @@ func (a *App) writeConfig() error {
 	defer a.configMu.Unlock()
 	a.mu.RLock()
 	domain := a.domain
+	direct := a.proxyMode == "direct"
 	routes := make([]Route, 0, len(a.routes))
 	for _, s := range a.routes {
 		s.mu.Lock()
@@ -36,6 +68,11 @@ func (a *App) writeConfig() error {
 		s.mu.Unlock()
 	}
 	a.mu.RUnlock()
+	if direct {
+		if err := checkDirectHAProxyVersion(); err != nil {
+			return err
+		}
+	}
 	sort.Slice(routes, func(i, j int) bool {
 		wi := strings.HasPrefix(routes[i].SNI, "*.")
 		wj := strings.HasPrefix(routes[j].SNI, "*.")
@@ -57,25 +94,33 @@ func (a *App) writeConfig() error {
 		publicLimit = 10000
 	}
 	reserve := max(8, min(256, publicLimit/10))
+	globalLimit := 2*publicLimit + reserve
+	if direct {
+		globalLimit = publicLimit + reserve
+	}
 	// Every client consumes an outer AND an inner HAProxy session. Without an
 	// outer cap, pending TLS handshakes can consume every global slot and prevent
 	// their own inner frontend from accepting, while CPU remains mostly idle.
-	fmt.Fprintf(&b, "global\n  maxconn %d\n  hard-stop-after 1h\n  stats socket "+filepath.Join(a.data, "haproxy.sock")+" mode 660"+socketGroup+" level admin expose-fd listeners\n  tune.ssl.default-dh-param 2048\n  ssl-default-bind-options ssl-min-ver TLSv1.2\n", 2*publicLimit+reserve)
+	fmt.Fprintf(&b, "global\n  maxconn %d\n  hard-stop-after 1h\n  stats timeout 2m\n  stats socket "+filepath.Join(a.data, "haproxy.sock")+" mode 660"+socketGroup+" level admin expose-fd listeners\n  tune.ssl.default-dh-param 2048\n  ssl-default-bind-options ssl-min-ver TLSv1.2\n", globalLimit)
 	fmt.Fprintln(&b, "defaults\n  mode http\n  timeout connect 5s\n  timeout client 1h\n  timeout server 1h\n  timeout tunnel 1h\n  timeout http-request 15s\n  timeout http-keep-alive 30s\n  timeout queue 10s\n  timeout client-fin 30s\n  timeout server-fin 30s\n  option clitcpka\n  option srvtcpka")
-	fmt.Fprintf(&b, "frontend public_sni\n  mode tcp\n  maxconn %d\n  bind :443\n  tcp-request inspect-delay 5s\n  tcp-request content accept if { req.ssl_hello_type 1 }\n  tcp-request content reject if WAIT_END\n", publicLimit)
-	fmt.Fprintf(&b, "  acl primary req.ssl_sni -i %s\n  use_backend relay_fallback if primary\n", domain)
-	for _, r := range routes {
-		fmt.Fprintf(&b, "  acl sni_%d req.ssl_sni %s\n", r.ID, aclPattern(r.SNI))
+	if !direct {
+		fmt.Fprintf(&b, "frontend public_sni\n  mode tcp\n  maxconn %d\n  bind :443\n  tcp-request inspect-delay 5s\n  tcp-request content accept if { req.ssl_hello_type 1 }\n  tcp-request content reject if WAIT_END\n", publicLimit)
+		fmt.Fprintf(&b, "  acl primary req.ssl_sni -i %s\n  use_backend relay_fallback if primary\n", domain)
+		for _, r := range routes {
+			fmt.Fprintf(&b, "  acl sni_%d req.ssl_sni %s\n", r.ID, aclPattern(r.SNI))
+		}
+		for _, r := range routes {
+			fmt.Fprintf(&b, "  use_backend relay_%d if sni_%d\n", r.ID, r.ID)
+		}
+		fmt.Fprintln(&b, "  default_backend relay_fallback")
+		fmt.Fprintln(&b, "backend relay_fallback\n  mode tcp\n  server relay 127.0.0.1:9999")
+		for _, r := range routes {
+			fmt.Fprintf(&b, "backend relay_%d\n  mode tcp\n  server relay 127.0.0.1:%d\n", r.ID, 10000+r.ID)
+		}
+		fmt.Fprintf(&b, "frontend internal_tls\n  mode http\n  maxconn %d\n  timeout client 30s\n  bind 127.0.0.1:8443 ssl crt %s", publicLimit+reserve, filepath.Join(a.data, "certs", "fallback.pem"))
+	} else {
+		fmt.Fprintf(&b, "frontend public_direct\n  mode http\n  option contstats\n  maxconn %d\n  timeout client 30s\n  bind :443 ssl crt %s", publicLimit, filepath.Join(a.data, "certs", "fallback.pem"))
 	}
-	for _, r := range routes {
-		fmt.Fprintf(&b, "  use_backend relay_%d if sni_%d\n", r.ID, r.ID)
-	}
-	fmt.Fprintln(&b, "  default_backend relay_fallback")
-	fmt.Fprintln(&b, "backend relay_fallback\n  mode tcp\n  server relay 127.0.0.1:9999")
-	for _, r := range routes {
-		fmt.Fprintf(&b, "backend relay_%d\n  mode tcp\n  server relay 127.0.0.1:%d\n", r.ID, 10000+r.ID)
-	}
-	fmt.Fprintf(&b, "frontend internal_tls\n  mode http\n  maxconn %d\n  timeout client 30s\n  bind 127.0.0.1:8443 ssl crt %s", publicLimit+reserve, filepath.Join(a.data, "certs", "fallback.pem"))
 	for _, r := range routes {
 		fmt.Fprintf(&b, " crt %s", filepath.Join(a.data, "certs", routeCert(r)+".pem"))
 	}
@@ -85,11 +130,15 @@ func (a *App) writeConfig() error {
 		fmt.Fprintf(&b, "  acl host_%d ssl_fc_sni %s\n", r.ID, aclPattern(r.SNI))
 	}
 	for _, r := range routes {
-		fmt.Fprintf(&b, "  use_backend target_%d if host_%d\n", r.ID, r.ID)
+		fmt.Fprintf(&b, "  use_backend %s if host_%d\n", routeBackend(r, direct), r.ID)
 	}
 	fmt.Fprintln(&b, "  default_backend fallback_page\nbackend fallback_page\n  server page 127.0.0.1:8181")
 	for _, r := range routes {
-		fmt.Fprintf(&b, "backend target_%d\n  mode http\n  server target %s", r.ID, net.JoinHostPort(r.IP, fmt.Sprint(r.Port)))
+		fmt.Fprintf(&b, "backend %s\n  mode http\n", routeBackend(r, direct))
+		if direct && r.Paused {
+			fmt.Fprintln(&b, "  http-request deny deny_status 503")
+		}
+		fmt.Fprintf(&b, "  server target %s", net.JoinHostPort(r.IP, fmt.Sprint(r.Port)))
 		if r.TLS {
 			fmt.Fprint(&b, " ssl")
 			if r.Verify {

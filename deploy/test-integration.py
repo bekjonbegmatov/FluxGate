@@ -82,6 +82,108 @@ def update(rid,**changes):
     r.update(changes)
     return api(f"/routes/{rid}","PUT",r)
 
+def set_mode(mode):
+    current=api('/settings')
+    payload={k:current[k] for k in ['domain','fallback_html','tg_api','tg_chat']}
+    return api('/settings','PUT',dict(payload,proxy_mode=mode))
+
+def open_tunnel(domain):
+    tunnel=tls_socket(domain)
+    tunnel.sendall(f"GET /tunnel HTTP/1.1\r\nHost: {domain}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n".encode())
+    headers=b''
+    while b'\r\n\r\n' not in headers: headers+=tunnel.recv(1024)
+    assert headers.startswith(b'HTTP/1.1 101'),headers
+    return tunnel
+
+def echo_bytes(tunnel,size):
+    payload=b'x'*min(size,16384)
+    remaining=size
+    while remaining:
+        chunk=payload[:min(remaining,len(payload))]
+        tunnel.sendall(chunk)
+        received=b''
+        while len(received)<len(chunk):
+            part=tunnel.recv(len(chunk)-len(received))
+            assert part,'tunnel closed'
+            received+=part
+        assert received==chunk
+        remaining-=len(chunk)
+
+def check_direct(ids):
+    set_mode('direct')
+    wait_for(lambda:'frontend public_direct' in compose('exec','-T','panel','cat','/data/haproxy.cfg'))
+    # Existing exhausted quotas / 1 byte/s limits must not affect direct mode.
+    update(ids[2],daily_limit=1,down_bps=1)
+    wait_for(lambda:download('route2.example.test',4*1024*1024)[0]==200)
+    wait_for(lambda:api('/system')['relay_connections']==0)
+    assert api('/settings')['proxy_mode']=='direct'
+    assert route(ids[2])['status']!='quota'
+    print('PASS: direct mode routes TLS without relay, quotas/rates bypassed explicitly',flush=True)
+
+    before=route(ids[0])['down_total']
+    assert download('route0.example.test',2*1024*1024)[0]==200
+    wait_for(lambda:route(ids[0])['down_total']>=before+2*1024*1024)
+    tunnel=open_tunnel('route0.example.test')
+    # Reloads must retain BOTH new and draining-worker counters.
+    before=route(ids[0])['down_total']
+    for i in range(3):
+        domain=f'direct-reload{i}.example.test'
+        update(ids[1],sni=domain)
+        wait_for(lambda:download(domain)[0]==200)
+        echo_bytes(tunnel,256*1024)
+    # Keep the connection open: contstats must update even without a close.
+    for _ in range(7):
+        echo_bytes(tunnel,32768)
+        time.sleep(1)
+    wait_for(lambda:route(ids[0])['down_total']>=before+3*256*1024)
+    assert api('/system')['relay_connections']==0
+    print('PASS: live direct WebSocket accounting survives three reloads',flush=True)
+
+    # Restart ONLY the panel while a direct connection is on an old worker.
+    before=route(ids[0])['down_total']
+    compose('restart','-t','45','panel')
+    wait_for(lambda:api('/settings')['proxy_mode']=='direct')
+    echo_bytes(tunnel,1024*1024)
+    wait_for(lambda:route(ids[0])['down_total']>=before+1024*1024)
+    assert route(ids[0])['down_total']<before+2*1024*1024,'counter doubled after panel restart'
+    update(ids[0],paused=True)
+    wait_for(lambda:download('route0.example.test')[0]==503)
+    try: assert tunnel.recv(1)==b''
+    except (OSError,ssl.SSLError): pass
+    tunnel.close()
+    update(ids[0],paused=False)
+    wait_for(lambda:download('route0.example.test')[0]==200)
+    print('PASS: panel restart recovers old-worker traffic; direct pause/resume works',flush=True)
+
+    # Public API cannot invoke restart without a session or confirmation.
+    try:
+        urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:19389/admin/api/restart',data=b'{"confirm":true}',headers={'Content-Type':'application/json'}))
+        raise AssertionError('unauthenticated restart accepted')
+    except urllib.error.HTTPError as error: assert error.code==401
+    old_start=api('/system')['process_started_at']
+    old_master=master_command('show proc').splitlines()
+    before=route(ids[0])['down_total']
+    api('/restart','POST',{'confirm':True})
+    wait_for(lambda:api('/system')['process_started_at']!=old_start,60)
+    wait_for(lambda:download('route0.example.test')[0]==200)
+    assert master_command('show proc').splitlines()!=old_master,'HAProxy did not restart'
+    assert api('/settings')['proxy_mode']=='direct'
+    assert route(ids[0])['down_total']>=before
+    print('PASS: confirmed full restart brings panel and HAProxy back with mode/counters intact',flush=True)
+
+    subprocess.run(COMPOSE+['exec','-T','origin','node','/test/load.mjs','20','4'],check=True)
+    assert api('/system')['relay_connections']==0
+    wait_for(lambda:route(ids[2])['daily_used']>route(ids[2])['daily_limit']+route(ids[2])['daily_extra'])
+    tunnel=open_tunnel('route0.example.test')
+    set_mode('relay')
+    wait_for(lambda:download('route2.example.test')[0]==429)
+    try: assert tunnel.recv(1)==b''
+    except (OSError,ssl.SSLError): pass
+    tunnel.close()
+    update(ids[2],daily_limit=0,down_bps=0)
+    wait_for(lambda:download('route0.example.test')[0]==200)
+    print('PASS: returning to relay closes direct tunnels and enforces saved quotas',flush=True)
+
 def main(seconds, history_days):
     compose("build")
     try:
@@ -178,6 +280,8 @@ def main(seconds, history_days):
 
         subprocess.run(COMPOSE+["exec","-T","origin","node","/test/capacity.mjs"],check=True)
         wait_for(lambda:download("route0.example.test")[0]==200)
+
+        check_direct(ids)
 
         if history_days:
             subprocess.run(COMPOSE+["exec","-T","origin","node","--experimental-sqlite","/test/seed-history.mjs",str(history_days)],check=True)

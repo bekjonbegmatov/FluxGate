@@ -105,6 +105,7 @@ func (a *App) adminServer() *http.Server {
 	mux.HandleFunc(base+"api/routes", a.auth(a.routesAPI))
 	mux.HandleFunc(base+"api/routes/", a.auth(a.routeAPI))
 	mux.HandleFunc(base+"api/settings", a.auth(a.settingsAPI))
+	mux.HandleFunc(base+"api/restart", a.auth(a.restartAPI))
 	mux.HandleFunc(base+"api/backup", a.auth(a.backupAPI))
 	mux.HandleFunc(base+"api/restore", a.auth(a.restoreAPI))
 	mux.HandleFunc(base+"api/history/", a.auth(a.historyAPI))
@@ -176,7 +177,7 @@ func (a *App) routesAPI(w http.ResponseWriter, r *http.Request) {
 			switch {
 			case v.Paused:
 				v.Status = "paused"
-			case s.blocked():
+			case a.proxyMode != "direct" && s.blocked():
 				v.Status = "quota"
 			case !s.healthy:
 				v.Status = "down"
@@ -250,6 +251,11 @@ func (a *App) createRoute(w http.ResponseWriter, v Route) {
 		return
 	}
 	v.ID, _ = result.LastInsertId()
+	if e = a.ensureMeterID(&v); e != nil {
+		_, _ = a.db.Exec("DELETE FROM routes WHERE id=?", v.ID)
+		fail(w, 500, e.Error())
+		return
+	}
 	if v.ID > 55535 {
 		_, _ = a.db.Exec("DELETE FROM routes WHERE id=?", v.ID)
 		fail(w, 400, "too many routes")
@@ -316,6 +322,7 @@ func (a *App) routeAPI(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		old := s.Route
 		v.CreatedAt = old.CreatedAt
+		v.MeterID = old.MeterID
 		v.UpTotal = old.UpTotal
 		v.DownTotal = old.DownTotal
 		s.mu.Unlock()
@@ -367,7 +374,7 @@ func (a *App) routeAPI(w http.ResponseWriter, r *http.Request) {
 		s.mu.Unlock()
 		_, _ = a.db.Exec("UPDATE periods SET threshold_sent=?,exhausted_sent=? WHERE route_id=? AND kind='daily' AND key=?", boolInt(daily.ThresholdSent), boolInt(daily.ExhaustedSent), id, daily.Key)
 		_, _ = a.db.Exec("UPDATE periods SET threshold_sent=?,exhausted_sent=? WHERE route_id=? AND kind='monthly' AND key=?", boolInt(monthly.ThresholdSent), boolInt(monthly.ExhaustedSent), id, monthly.Key)
-		if blocked {
+		if blocked && !a.directMode() {
 			a.exhaust(s)
 		}
 		writeJSON(w, 200, v)
@@ -384,7 +391,7 @@ func (a *App) routeAPI(w http.ResponseWriter, r *http.Request) {
 		}
 		tx, err := a.db.Begin()
 		if err == nil {
-			for _, table := range []string{"routes", "periods", "samples", "request_totals", "request_samples", "rentals", "payments"} {
+			for _, table := range []string{"routes", "route_meter_ids", "periods", "samples", "request_totals", "request_samples", "rentals", "payments"} {
 				column := "route_id"
 				if table == "routes" {
 					column = "id"
@@ -504,102 +511,15 @@ func (a *App) settingsAPI(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case "GET":
 		a.mu.RLock()
-		v := map[string]any{"domain": a.domain, "timezone": a.location.String(), "fallback_html": a.fallback, "tg_api": a.tg.APIURL, "tg_chat": a.tg.ChatID, "tg_token_set": a.tg.BotToken != ""}
+		mode := a.proxyMode
+		if mode == "" {
+			mode = "relay"
+		}
+		v := map[string]any{"domain": a.domain, "proxy_mode": mode, "timezone": a.location.String(), "fallback_html": a.fallback, "tg_api": a.tg.APIURL, "tg_chat": a.tg.ChatID, "tg_token_set": a.tg.BotToken != ""}
 		a.mu.RUnlock()
 		writeJSON(w, 200, v)
 	case "PUT":
-		a.stateMu.Lock()
-		defer a.stateMu.Unlock()
-		var v struct {
-			Domain       string `json:"domain"`
-			FallbackHTML string `json:"fallback_html"`
-			TGAPI        string `json:"tg_api"`
-			TGChat       string `json:"tg_chat"`
-			TGToken      string `json:"tg_token"`
-		}
-		if readJSON(r, &v) != nil {
-			fail(w, 400, "invalid JSON")
-			return
-		}
-		if len(v.FallbackHTML) > 1<<20 {
-			fail(w, 400, "HTML too large")
-			return
-		}
-		v.Domain = strings.ToLower(strings.TrimSpace(v.Domain))
-		if v.Domain != "" && !validDomain(v.Domain) {
-			fail(w, 400, "invalid domain")
-			return
-		}
-		u, e := url.Parse(v.TGAPI)
-		if e != nil || u.Scheme != "https" || u.Host == "" {
-			fail(w, 400, "Bot API URL must use HTTPS")
-			return
-		}
-		a.mu.RLock()
-		oldDomain := a.domain
-		a.mu.RUnlock()
-		if v.Domain == "" {
-			v.Domain = oldDomain
-		}
-		if v.Domain != oldDomain {
-			a.mu.RLock()
-			conflict := false
-			for _, route := range a.routes {
-				route.mu.Lock()
-				sni := route.Route.SNI
-				route.mu.Unlock()
-				if sni == v.Domain || (strings.HasPrefix(sni, "*.") && strings.HasSuffix(v.Domain, sni[1:])) {
-					conflict = true
-					break
-				}
-			}
-			a.mu.RUnlock()
-			if conflict {
-				fail(w, 409, "domain is already used by a server route")
-				return
-			}
-			certPath := filepath.Join(a.data, "certs", "fallback.pem")
-			oldCert, err := os.ReadFile(certPath)
-			if err != nil {
-				fail(w, 500, err.Error())
-				return
-			}
-			if err = a.ensureCert("fallback", v.Domain); err != nil {
-				fail(w, 500, err.Error())
-				return
-			}
-			a.mu.Lock()
-			a.domain = v.Domain
-			a.mu.Unlock()
-			if err = a.writeConfig(); err == nil {
-				err = a.setSetting("domain", v.Domain)
-			}
-			if err != nil {
-				a.mu.Lock()
-				a.domain = oldDomain
-				a.mu.Unlock()
-				_ = os.WriteFile(certPath, oldCert, 0600)
-				_ = a.writeConfig()
-				fail(w, 500, err.Error())
-				return
-			}
-		}
-		a.mu.Lock()
-		a.fallback = v.FallbackHTML
-		a.tg.APIURL = strings.TrimRight(v.TGAPI, "/")
-		a.tg.ChatID = v.TGChat
-		if v.TGToken != "" {
-			a.tg.BotToken = v.TGToken
-		}
-		tg := a.tg
-		a.mu.Unlock()
-		_ = a.setSetting("fallback_html", v.FallbackHTML)
-		_ = a.setSetting("tg_api", tg.APIURL)
-		_ = a.setSetting("tg_chat", tg.ChatID)
-		if v.TGToken != "" {
-			_ = a.setSetting("tg_token", a.encrypt(tg.BotToken))
-		}
-		writeJSON(w, 200, map[string]bool{"ok": true})
+		a.updateSettings(w, r)
 	default:
 		fail(w, 405, "method")
 	}

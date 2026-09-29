@@ -35,6 +35,7 @@ import (
 )
 
 type Route struct {
+	MeterID      string `json:"-"`
 	ID           int64  `json:"id"`
 	Name         string `json:"name"`
 	SNI          string `json:"sni"`
@@ -89,6 +90,7 @@ type RouteState struct {
 	savedUp, savedDown             int64
 	rateUp, rateDown               int64
 	rateAt                         time.Time
+	rateHistory                    []trafficRateSample
 	deleted                        bool
 	retired                        map[string]retiredPeriod
 }
@@ -117,6 +119,12 @@ type App struct {
 	start                         time.Time
 	flushInterval                 time.Duration
 	maxConnections                int
+	proxyMode                     string // protected by mu; empty means relay (old installs)
+	direct                        directMeter
+	restartRequested              atomic.Bool
+	restartService                func()
+	directLastOK                  atomic.Int64
+	directErrors                  atomic.Uint64
 	// stateMu serializes control-plane changes and persistence, never relay I/O.
 	stateMu              sync.Mutex
 	collectMu            sync.Mutex
@@ -189,6 +197,10 @@ func main() {
 	fatal(err)
 	a := &App{db: db, data: data, web: env("PANEL_WEB", "./web/dist"), secretPath: strings.Trim(env("PANEL_SECRET_PATH", "admin"), "/"), domain: strings.ToLower(env("PANEL_DOMAIN", "proxy.local.invalid")), tokenHash: sha256.Sum256([]byte(token)), master: []byte(master), location: loc, routes: map[int64]*RouteState{}, start: time.Now()}
 	a.domain = a.getSetting("domain", a.domain)
+	a.proxyMode = a.getSetting("proxy_mode", "relay")
+	if !validProxyMode(a.proxyMode) {
+		log.Fatal("invalid proxy_mode setting")
+	}
 	a.flushInterval, err = time.ParseDuration(env("PANEL_FLUSH_INTERVAL", "5s"))
 	fatal(err)
 	if a.flushInterval < time.Second || a.flushInterval > time.Minute {
@@ -209,6 +221,7 @@ func main() {
 	a.tg = TelegramSettings{APIURL: a.getSetting("tg_api", "https://api.telegram.org"), BotToken: a.decrypt(a.getSetting("tg_token", "")), ChatID: a.getSetting("tg_chat", "")}
 	fatal(a.initFinance())
 	fatal(a.initRequestStats())
+	fatal(a.initDirectMeter())
 	fatal(a.initHistoryIndexes())
 	a.liveStats = map[int64]RequestStats{}
 	fatal(a.ensureCert("fallback", a.domain))
@@ -217,6 +230,7 @@ func main() {
 	fatal(a.startListeners())
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	a.restartService = stop
 	tickDone := make(chan struct{})
 	go func() { defer close(tickDone); a.tick(ctx) }()
 	go a.serveFallback()
@@ -236,8 +250,18 @@ func main() {
 	}
 	a.stopRelays()
 	<-tickDone
+	if a.restartRequested.Load() {
+		a.quiesceHAProxy()
+	}
+	a.collectDirectTraffic(time.Now())
 	if err := a.flushTraffic(time.Now()); err != nil {
 		log.Printf("final traffic flush: %v", err)
+	}
+	a.closeDirectMeter()
+	if a.restartRequested.Load() {
+		// Only the HAProxy supervisor reads this marker. No Docker socket or
+		// privileged shell is exposed to the HTTP panel.
+		fatal(os.WriteFile(filepath.Join(a.data, "haproxy.restart-request"), []byte("restart\n"), 0600))
 	}
 	fatal(db.Close())
 }
@@ -347,6 +371,9 @@ func (a *App) loadRoutes() error {
 		return err
 	}
 	for _, s := range loaded {
+		if err := a.ensureMeterID(&s.Route); err != nil {
+			return err
+		}
 		if err := a.refreshPeriods(s, time.Now()); err != nil {
 			return err
 		}

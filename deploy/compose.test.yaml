@@ -1,6 +1,7 @@
 # Isolated, loopback-only integration stack. Never use the production volume.
 services:
   haproxy:
+    restart: unless-stopped
     image: fluxgate-test-haproxy
     build: ../haproxy
     init: true
@@ -12,6 +13,7 @@ services:
     ulimits:
       nofile: 262144
   panel:
+    restart: unless-stopped
     image: fluxgate-test-panel
     build: ..
     init: true

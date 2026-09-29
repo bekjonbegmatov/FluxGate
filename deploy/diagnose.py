@@ -40,7 +40,7 @@ def runtime_metrics(path):
             result["info"] = {k: v.strip() for line in body.splitlines() if ":" in line for k, v in [line.split(":", 1)] if k in allowed}
         else:
             fields = {"scur", "smax", "slim", "stot", "rate", "ereq", "dreq", "status"}
-            result["frontends"] = {row["# pxname"]: {k: v for k, v in row.items() if k in fields} for row in csv.DictReader(io.StringIO(body)) if row.get("svname") == "FRONTEND" and row.get("# pxname") in {"public_sni", "internal_tls"}}
+            result["frontends"] = {row["# pxname"]: {k: v for k, v in row.items() if k in fields} for row in csv.DictReader(io.StringIO(body)) if row.get("svname") == "FRONTEND" and row.get("# pxname") in {"public_sni", "internal_tls", "public_direct"}}
     return result
 
 

@@ -64,6 +64,7 @@ func (a *App) backupAPI(w http.ResponseWriter, r *http.Request) {
 // Snapshot and compress to a private file, then release stateMu BEFORE sending
 // to the network. Slow backup downloads must not stop accounting or rollover.
 func (a *App) writeBackup(ctx context.Context, dst io.Writer) error {
+	a.collectDirectTraffic(time.Now())
 	if err := a.flushTraffic(time.Now()); err != nil {
 		return err
 	}
@@ -256,6 +257,30 @@ func (a *App) stageRestore(src io.Reader) (string, error) {
 		var count int
 		if e = db.QueryRow("SELECT count(*) FROM " + table).Scan(&count); e != nil {
 			return "", fmt.Errorf("missing table %s", table)
+		}
+	}
+	var mode string
+	if e = db.QueryRow("SELECT value FROM settings WHERE key='proxy_mode'").Scan(&mode); e != nil && e != sql.ErrNoRows {
+		return "", e
+	} else if e == nil && !validProxyMode(mode) {
+		return "", fmt.Errorf("invalid proxy_mode in backup")
+	}
+	if mode == "direct" {
+		if e = checkDirectHAProxyVersion(); e != nil {
+			return "", e
+		}
+	}
+	var meterTable int
+	if e = db.QueryRow("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='route_meter_ids'").Scan(&meterTable); e != nil {
+		return "", e
+	}
+	if meterTable > 0 {
+		var invalid int
+		if e = db.QueryRow("SELECT count(*) FROM route_meter_ids WHERE length(token)<>32 OR token GLOB '*[^0-9a-f]*'").Scan(&invalid); e != nil {
+			return "", e
+		}
+		if invalid > 0 {
+			return "", fmt.Errorf("invalid route meter identity in backup")
 		}
 	}
 	rows, e := db.Query("SELECT id,name,sni,ip,port,tls,verify,verify_name,paused,daily_limit,monthly_limit,count_mode,down_bps,up_bps,threshold FROM routes")

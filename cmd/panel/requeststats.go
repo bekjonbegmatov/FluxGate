@@ -81,10 +81,10 @@ func readHAProxyStats(path string) (map[int64]requestCounter, error) {
 			continue
 		}
 		name := field(row, "pxname")
-		if !strings.HasPrefix(name, "target_") {
+		if !strings.HasPrefix(name, "target_") && !strings.HasPrefix(name, "direct_") {
 			continue
 		}
-		id, e := strconv.ParseInt(strings.TrimPrefix(name, "target_"), 10, 64)
+		id, e := strconv.ParseInt(strings.SplitN(strings.TrimPrefix(strings.TrimPrefix(name, "target_"), "direct_"), "_", 2)[0], 10, 64)
 		if e != nil || id <= 0 {
 			continue
 		}

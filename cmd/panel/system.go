@@ -13,45 +13,76 @@ import (
 	"time"
 )
 
+type cpuCounters struct{ total, idle, wait, softirq, steal uint64 }
+type cpuUsageStats struct{ busy, wait, softirq, steal float64 }
+
 var cpuSample struct {
 	sync.Mutex
-	total, idle uint64
+	previous cpuCounters
+	usage    cpuUsageStats
 }
 
-func cpuPercent() float64 {
-	b, err := os.ReadFile("/proc/stat")
-	if err != nil {
-		return 0
+func parseCPUCounters(data []byte) (cpuCounters, bool) {
+	fields := strings.Fields(strings.SplitN(string(data), "\n", 2)[0])
+	if len(fields) < 5 || fields[0] != "cpu" {
+		return cpuCounters{}, false
 	}
-	f := strings.Fields(strings.SplitN(string(b), "\n", 2)[0])
-	if len(f) < 5 {
-		return 0
-	}
-	var total, idle uint64
-	for i := 1; i < len(f); i++ {
-		v, _ := strconv.ParseUint(f[i], 10, 64)
-		total += v
-		if i == 4 || i == 5 {
-			idle += v
+	var counts [8]uint64
+	for i := 0; i < 8 && i+1 < len(fields); i++ {
+		v, err := strconv.ParseUint(fields[i+1], 10, 64)
+		if err != nil {
+			return cpuCounters{}, false
 		}
+		counts[i] = v
+	}
+	// guest/guest_nice are already included in user/nice; do not sum twice.
+	var total uint64
+	for _, v := range counts {
+		total += v
+	}
+	return cpuCounters{total, counts[3], counts[4], counts[6], counts[7]}, true
+}
+func cpuDelta(current, previous cpuCounters) cpuUsageStats {
+	if current.total <= previous.total {
+		return cpuUsageStats{}
+	}
+	delta := func(c, p uint64) float64 {
+		if c < p {
+			return 0
+		}
+		return float64(c-p) * 100 / float64(current.total-previous.total)
+	}
+	idle, wait, steal := delta(current.idle, previous.idle), delta(current.wait, previous.wait), delta(current.steal, previous.steal)
+	return cpuUsageStats{max(0, min(100, 100-idle-wait-steal)), wait, delta(current.softirq, previous.softirq), steal}
+}
+func readCPUUsage() cpuUsageStats {
+	data, err := os.ReadFile("/proc/stat")
+	if err != nil {
+		return cpuUsageStats{}
+	}
+	current, ok := parseCPUCounters(data)
+	if !ok {
+		return cpuUsageStats{}
 	}
 	cpuSample.Lock()
 	defer cpuSample.Unlock()
-	if cpuSample.total == 0 {
-		cpuSample.total, cpuSample.idle = total, idle
-		return 0
+	if cpuSample.previous.total == 0 {
+		cpuSample.previous = current
+		return cpuUsageStats{}
 	}
-	dt, di := total-cpuSample.total, idle-cpuSample.idle
-	cpuSample.total, cpuSample.idle = total, idle
-	if dt == 0 {
-		return 0
+	if current.total == cpuSample.previous.total {
+		return cpuSample.usage
 	}
-	return float64(dt-di) * 100 / float64(dt)
+	cpuSample.usage = cpuDelta(current, cpuSample.previous)
+	cpuSample.previous = current
+	return cpuSample.usage
 }
 
 func readHostStats() map[string]any {
 	out := map[string]any{"time": time.Now().Unix()}
-	out["cpu_percent"] = cpuPercent()
+	cpu := readCPUUsage()
+	out["cpu_percent"], out["cpu_iowait_percent"], out["cpu_softirq_percent"], out["cpu_steal_percent"] = cpu.busy, cpu.wait, cpu.softirq, cpu.steal
+	out["cpu_logical_cores"] = runtime.NumCPU()
 	if b, e := os.ReadFile("/proc/loadavg"); e == nil {
 		f := strings.Fields(string(b))
 		if len(f) >= 3 {
@@ -89,6 +120,14 @@ func (a *App) systemAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	stats := readHostStats()
+	stats["process_started_at"] = a.start.UTC().Format(time.RFC3339Nano)
+	direct := a.directMode()
+	stats["proxy_mode"] = "relay"
+	if direct {
+		stats["proxy_mode"] = "direct"
+	}
+	stats["direct_stats_last_ok_unix"] = a.directLastOK.Load()
+	stats["direct_stats_errors"] = a.directErrors.Load()
 	stats["uptime_seconds"] = int64(time.Since(a.start).Seconds())
 	stats["goroutines"] = runtime.NumGoroutine()
 	var memory runtime.MemStats
@@ -103,7 +142,7 @@ func (a *App) systemAPI(w http.ResponseWriter, r *http.Request) {
 		if s.Route.Paused {
 			paused++
 		}
-		if s.blocked() {
+		if !direct && s.blocked() {
 			quota++
 		}
 		s.mu.Unlock()

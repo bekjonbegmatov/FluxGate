@@ -426,6 +426,7 @@ func (a *App) tick(ctx context.Context) {
 		}()
 	}
 	run(10*time.Second, a.collectRequestStats)
+	run(time.Second, a.collectDirectTraffic)
 	run(time.Second, a.sampleRates)
 	run(time.Minute, a.checkRentals)
 	run(10*time.Second, func(_ time.Time) {

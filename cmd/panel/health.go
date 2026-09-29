@@ -21,7 +21,11 @@ func (a *App) healthAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Check both services, not only that the SPA is being served from disk.
-	for _, addr := range []struct{ network, address string }{{"unix", filepath.Join(a.data, "haproxy.sock")}, {"tcp", "127.0.0.1:443"}, {"tcp", "127.0.0.1:8443"}, {"tcp", "127.0.0.1:8181"}} {
+	addresses := []struct{ network, address string }{{"unix", filepath.Join(a.data, "haproxy.sock")}, {"tcp", "127.0.0.1:443"}, {"tcp", "127.0.0.1:8181"}}
+	if !a.directMode() {
+		addresses = append(addresses, struct{ network, address string }{"tcp", "127.0.0.1:8443"})
+	}
+	for _, addr := range addresses {
 		c, err := (&net.Dialer{}).DialContext(ctx, addr.network, addr.address)
 		if err != nil {
 			w.WriteHeader(http.StatusServiceUnavailable)

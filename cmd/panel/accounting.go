@@ -70,14 +70,15 @@ func (a *App) flushTraffic(now time.Time) (result error) {
 		retired  map[string]retiredPeriod
 	}
 	var batch []snapshot
+	direct := a.directMode()
 	for _, s := range a.routeStates() {
 		s.mu.Lock()
 		r := s.Route
-		if r.DailyLimit > 0 && !s.Daily.ThresholdSent && !s.Daily.ExhaustedSent && quotaReachedThreshold(s.Daily.Used, r.DailyLimit+s.Daily.Extra, r.Threshold) {
+		if !direct && r.DailyLimit > 0 && !s.Daily.ThresholdSent && !s.Daily.ExhaustedSent && quotaReachedThreshold(s.Daily.Used, r.DailyLimit+s.Daily.Extra, r.Threshold) {
 			s.Daily.ThresholdSent = true
 			go a.notify(r, quotaThresholdMessage("daily", s.Daily.Used, r.DailyLimit+s.Daily.Extra))
 		}
-		if r.MonthlyLimit > 0 && !s.Monthly.ThresholdSent && !s.Monthly.ExhaustedSent && quotaReachedThreshold(s.Monthly.Used, r.MonthlyLimit+s.Monthly.Extra, r.Threshold) {
+		if !direct && r.MonthlyLimit > 0 && !s.Monthly.ThresholdSent && !s.Monthly.ExhaustedSent && quotaReachedThreshold(s.Monthly.Used, r.MonthlyLimit+s.Monthly.Extra, r.Threshold) {
 			s.Monthly.ThresholdSent = true
 			go a.notify(r, quotaThresholdMessage("monthly", s.Monthly.Used, r.MonthlyLimit+s.Monthly.Extra))
 		}
@@ -90,7 +91,7 @@ func (a *App) flushTraffic(now time.Time) (result error) {
 		}
 		s.mu.Unlock()
 	}
-	if len(batch) == 0 {
+	if len(batch) == 0 && len(a.direct.pending) == 0 {
 		return nil
 	}
 	tx, err := a.db.Begin()
@@ -120,8 +121,17 @@ func (a *App) flushTraffic(now time.Time) (result error) {
 			}
 		}
 	}
+	if err = a.saveDirectCheckpoints(tx, now); err != nil {
+		return err
+	}
 	if err = tx.Commit(); err != nil {
 		return err
+	}
+	clear(a.direct.pending)
+	for key, value := range a.direct.last {
+		if value.seen < now.Add(-48*time.Hour).Unix() {
+			delete(a.direct.last, key)
+		}
 	}
 	for _, v := range batch {
 		v.s.mu.Lock()
@@ -139,9 +149,38 @@ func (a *App) flushTraffic(now time.Time) (result error) {
 	return nil
 }
 
+type trafficRateSample struct {
+	at       time.Time
+	up, down int64
+}
+
 func (a *App) sampleRates(now time.Time) {
+	direct := a.directMode()
 	for _, s := range a.routeStates() {
 		s.mu.Lock()
+		if direct {
+			// HAProxy contstats updates long streams approximately every 5s.
+			// A 10s window avoids displaying one-second spikes and false zeros.
+			if len(s.rateHistory) == 0 {
+				at := s.rateAt
+				if at.IsZero() {
+					at = now.Add(-time.Second)
+				}
+				s.rateHistory = append(s.rateHistory, trafficRateSample{at, s.rateUp, s.rateDown})
+			}
+			s.rateHistory = append(s.rateHistory, trafficRateSample{now, s.Route.UpTotal, s.Route.DownTotal})
+			for len(s.rateHistory) > 2 && !s.rateHistory[1].at.After(now.Add(-10*time.Second)) {
+				s.rateHistory = s.rateHistory[1:]
+			}
+			first := s.rateHistory[0]
+			elapsed := max(1, now.Sub(first.at).Seconds())
+			s.lastUp = int64(float64(s.Route.UpTotal-first.up) / elapsed)
+			s.lastDown = int64(float64(s.Route.DownTotal-first.down) / elapsed)
+			s.rateUp, s.rateDown, s.rateAt = s.Route.UpTotal, s.Route.DownTotal, now
+			s.mu.Unlock()
+			continue
+		}
+		s.rateHistory = nil
 		elapsed := now.Sub(s.rateAt).Seconds()
 		if s.rateAt.IsZero() || elapsed <= 0 {
 			elapsed = 1
@@ -192,7 +231,7 @@ func (a *App) rollPeriods(now time.Time) error {
 			}
 			s.retired[kind+":"+previous.Key] = retiredPeriod{previous, reserved}
 			s.mu.Unlock()
-			if limit > 0 {
+			if limit > 0 && !a.directMode() {
 				go a.notify(r, quotaResetMessage(kind, limit+p.Extra))
 			}
 		}

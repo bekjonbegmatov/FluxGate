@@ -25,6 +25,11 @@ func haproxyCommand(path, command string) ([]byte, error) {
 	if _, err = io.WriteString(c, command+"\n"); err != nil {
 		return nil, err
 	}
+	// The master CLI accepts multiple commands and otherwise waits for more
+	// input instead of closing after its reply. Signal EOF, but keep reading.
+	if unix, ok := c.(*net.UnixConn); ok {
+		_ = unix.CloseWrite()
+	}
 	return io.ReadAll(io.LimitReader(c, 8<<20))
 }
 
@@ -84,7 +89,7 @@ func printDiagnostics(dst io.Writer) error {
 		reader.FieldsPerRecord = -1
 		if rows, err := reader.ReadAll(); err == nil && len(rows) > 0 {
 			for _, row := range rows[1:] {
-				if len(row) < 2 || row[1] != "FRONTEND" || (row[0] != "public_sni" && row[0] != "internal_tls") {
+				if len(row) < 2 || row[1] != "FRONTEND" || (row[0] != "public_sni" && row[0] != "internal_tls" && row[0] != "public_direct") {
 					continue
 				}
 				v := map[string]string{}

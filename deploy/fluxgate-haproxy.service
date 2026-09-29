@@ -7,6 +7,7 @@ After=fluxgate-panel.service
 Type=simple
 Environment=FLUXGATE_CONFIG=/var/lib/fluxgate/haproxy.cfg
 Environment=FLUXGATE_PID=/run/fluxgate/haproxy.pid
+Environment=FLUXGATE_MASTER_GROUP=fluxgate
 RuntimeDirectory=fluxgate
 ExecStart=/usr/local/libexec/fluxgate-watch
 Restart=always
