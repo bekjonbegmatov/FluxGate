@@ -106,6 +106,7 @@ type App struct {
 	master                        []byte
 	location                      *time.Location
 	routes                        map[int64]*RouteState
+	deleting                      map[int64]*RouteState // accounting during transactional route deletion
 	mu                            sync.RWMutex
 	fallback                      string
 	tg                            TelegramSettings
@@ -120,11 +121,14 @@ type App struct {
 	flushInterval                 time.Duration
 	maxConnections                int
 	proxyMode                     string // protected by mu; empty means relay (old installs)
+	directLimits                  bool   // explicit opt-in, protected by mu
 	direct                        directMeter
 	restartRequested              atomic.Bool
 	restartService                func()
 	directLastOK                  atomic.Int64
 	directErrors                  atomic.Uint64
+	publicProbe                   publicProbeState
+	publicConnections, publicPeak atomic.Int64
 	// stateMu serializes control-plane changes and persistence, never relay I/O.
 	stateMu              sync.Mutex
 	collectMu            sync.Mutex
@@ -153,6 +157,13 @@ func fatal(err error) {
 	}
 }
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == "--watchdog" {
+		log.SetPrefix("quota watchdog: ")
+		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+		defer stop()
+		directWatchdog(ctx, env("PANEL_DATA", "/data"))
+		return
+	}
 	if len(os.Args) == 2 && os.Args[1] == "--diagnose" {
 		if err := printDiagnostics(os.Stdout); err != nil {
 			log.Print(err)
@@ -167,11 +178,23 @@ func main() {
 		}
 		return
 	}
-	if len(os.Args) != 1 {
-		log.Fatal("supported options: --healthcheck, --diagnose")
+	if len(os.Args) == 1 {
+		fatal(supervise())
+		return
 	}
+	if len(os.Args) == 2 && os.Args[1] == "--web" {
+		fatal(runWeb())
+		return
+	}
+	if len(os.Args) != 2 || os.Args[1] != "--agent" {
+		log.Fatal("supported options: --healthcheck, --diagnose, --web, --agent")
+	}
+	log.SetPrefix("agent: ")
 	data := env("PANEL_DATA", "./data")
 	fatal(os.MkdirAll(data, 0700))
+	lock, err := lockAgent(data)
+	fatal(err)
+	defer lock.Close()
 	fatal(applyPendingRestore(data))
 	fatal(os.MkdirAll(filepath.Join(data, "certs"), 0700))
 	db, err := sql.Open("sqlite", filepath.Join(data, "panel.db"))
@@ -198,6 +221,11 @@ func main() {
 	a := &App{db: db, data: data, web: env("PANEL_WEB", "./web/dist"), secretPath: strings.Trim(env("PANEL_SECRET_PATH", "admin"), "/"), domain: strings.ToLower(env("PANEL_DOMAIN", "proxy.local.invalid")), tokenHash: sha256.Sum256([]byte(token)), master: []byte(master), location: loc, routes: map[int64]*RouteState{}, start: time.Now()}
 	a.domain = a.getSetting("domain", a.domain)
 	a.proxyMode = a.getSetting("proxy_mode", "relay")
+	limitSetting := a.getSetting("direct_limits", "false")
+	if limitSetting != "false" && limitSetting != "true" {
+		log.Fatal("invalid direct_limits setting")
+	}
+	a.directLimits = limitSetting == "true"
 	if !validProxyMode(a.proxyMode) {
 		log.Fatal("invalid proxy_mode setting")
 	}
@@ -235,8 +263,10 @@ func main() {
 	go func() { defer close(tickDone); a.tick(ctx) }()
 	go a.serveFallback()
 	server := a.adminServer()
+	listener, err := listenAgent(data)
+	fatal(err)
 	go func() {
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
 			log.Printf("panel: %v", err)
 			stop()
 		}

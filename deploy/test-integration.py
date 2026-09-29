@@ -82,10 +82,82 @@ def update(rid,**changes):
     r.update(changes)
     return api(f"/routes/{rid}","PUT",r)
 
-def set_mode(mode):
+def set_mode(mode, **settings):
     current=api('/settings')
     payload={k:current[k] for k in ['domain','fallback_html','tg_api','tg_chat']}
-    return api('/settings','PUT',dict(payload,proxy_mode=mode))
+    return api('/settings','PUT',dict(payload,proxy_mode=mode,**settings))
+
+def assert_tunnel_closed(tunnel):
+    tunnel.settimeout(5)
+    try:
+        assert tunnel.recv(1)==b'', 'blocked tunnel still transfers bytes'
+    except TimeoutError as error:
+        raise AssertionError('blocked tunnel remained open') from error
+    except (ConnectionResetError,ssl.SSLEOFError):
+        pass
+
+def check_direct_limits(ids):
+    # Old direct settings remain opt-in; enabling must enforce existing usage.
+    set_mode('direct',direct_limits=True)
+    wait_for(lambda:download('route2.example.test')[0]==503)
+    assert route(ids[2])['status']=='quota'
+    update(ids[2],down_bps=0)
+    api(f'/routes/{ids[2]}/topup','POST',{'kind':'daily','bytes':route(ids[2])['daily_used']+2*1024*1024})
+    wait_for(lambda:download('route2.example.test')[0]==200)
+    update(ids[2],monthly_limit=1)
+    wait_for(lambda:download('route2.example.test')[0]==503)
+    api(f'/routes/{ids[2]}/topup','POST',{'kind':'monthly','bytes':route(ids[2])['monthly_used']+2*1024*1024})
+    wait_for(lambda:download('route2.example.test')[0]==200)
+    print('PASS: direct daily/monthly soft quotas and topups',flush=True)
+
+    update(ids[0],down_bps=128*1024)
+    time.sleep(4)
+    started=time.monotonic()
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        result=list(pool.map(lambda _:download('route0.example.test',128*1024),range(4)))
+    elapsed=time.monotonic()-started
+    assert all(r[0]==200 for r in result) and elapsed>=2,elapsed
+    tunnel=open_tunnel('route0.example.test')
+    started=time.monotonic()
+    echo_bytes(tunnel,256*1024)
+    assert time.monotonic()-started>=1,'direct WS bypassed bandwidth filter'
+    update(ids[1],sni='limited-reload.example.test')
+    wait_for(lambda:download('limited-reload.example.test')[0]==200)
+    assert_tunnel_closed(tunnel)
+    tunnel.close()
+    update(ids[0],down_bps=0,daily_limit=route(ids[0])['daily_used']+1024**3)
+    wait_for(lambda:download('route0.example.test')[0]==200)
+    time.sleep(4)
+    tunnel=open_tunnel('route0.example.test')
+    pid=str(api('/system')['agent_pid'])
+    compose('exec','-T','panel','kill','-STOP',pid)
+    try:
+        wait_for(lambda:download('route0.example.test')[0]==503,25)
+        assert download('limited-reload.example.test')[0]==200,'unlimited direct route was stopped'
+        assert_tunnel_closed(tunnel)
+    finally:
+        compose('exec','-T','panel','kill','-CONT',pid)
+        tunnel.close()
+    wait_for(lambda:download('route0.example.test')[0]==200)
+    tunnel=open_tunnel('route0.example.test')
+    # Keep a quota-bearing stream on a draining generation: the watchdog must
+    # close it even though ordinary server commands reject stopped backends.
+    update(ids[1],sni='watchdog-reload.example.test')
+    wait_for(lambda:download('watchdog-reload.example.test')[0]==200)
+    echo_bytes(tunnel,1024)
+    compose('pause','panel')
+    try:
+        wait_for(lambda:download('route0.example.test')[0]==503,25)
+        assert download('watchdog-reload.example.test')[0]==200
+        assert_tunnel_closed(tunnel)
+    finally:
+        compose('unpause','panel')
+        tunnel.close()
+    wait_for(lambda:download('route0.example.test')[0]==200)
+    update(ids[0],daily_limit=0)
+    update(ids[2],monthly_limit=0)
+    set_mode('direct',direct_limits=False)
+    print(f'PASS: direct shared bandwidth ({elapsed:.2f}s), WebSocket shaping, reload and watchdog survives frozen agent/container',flush=True)
 
 def open_tunnel(domain):
     tunnel=tls_socket(domain)
@@ -148,8 +220,7 @@ def check_direct(ids):
     assert route(ids[0])['down_total']<before+2*1024*1024,'counter doubled after panel restart'
     update(ids[0],paused=True)
     wait_for(lambda:download('route0.example.test')[0]==503)
-    try: assert tunnel.recv(1)==b''
-    except (OSError,ssl.SSLError): pass
+    assert_tunnel_closed(tunnel)
     tunnel.close()
     update(ids[0],paused=False)
     wait_for(lambda:download('route0.example.test')[0]==200)
@@ -173,12 +244,15 @@ def check_direct(ids):
 
     subprocess.run(COMPOSE+['exec','-T','origin','node','/test/load.mjs','20','4'],check=True)
     assert api('/system')['relay_connections']==0
+    check_direct_limits(ids)
+    update(ids[2],daily_limit=1)
+    remaining=max(0,route(ids[2])['daily_limit']+route(ids[2])['daily_extra']-route(ids[2])['daily_used'])
+    wait_for(lambda:download('route2.example.test',remaining+4*1024*1024)[0]==200)
     wait_for(lambda:route(ids[2])['daily_used']>route(ids[2])['daily_limit']+route(ids[2])['daily_extra'])
     tunnel=open_tunnel('route0.example.test')
     set_mode('relay')
     wait_for(lambda:download('route2.example.test')[0]==429)
-    try: assert tunnel.recv(1)==b''
-    except (OSError,ssl.SSLError): pass
+    assert_tunnel_closed(tunnel)
     tunnel.close()
     update(ids[2],daily_limit=0,down_bps=0)
     wait_for(lambda:download('route0.example.test')[0]==200)
@@ -203,6 +277,16 @@ def main(seconds, history_days):
         update(ids[0],name="Renamed",down_bps=0)
         assert config_hash()==initial_hash,"metadata triggered a reload"
         print("PASS: routing, stable order, deterministic/no-op config",flush=True)
+
+        # An independent web heap/process must not own the traffic lifecycle.
+        agent=api('/system')['agent_pid']
+        live=open_tunnel('route0.example.test')
+        web=compose('exec','-T','panel','pgrep','-f','^/usr/local/bin/panel --web$')
+        compose('exec','-T','panel','kill','-KILL',web)
+        echo_bytes(live,256*1024)
+        wait_for(lambda:api('/system')['agent_pid']==agent)
+        live.close()
+        print('PASS: web process crash/restart preserves relay connections',flush=True)
 
         tunnel=tls_socket("route0.example.test")
         tunnel.sendall(b"GET /tunnel HTTP/1.1\r\nHost: route0.example.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n")
@@ -267,7 +351,7 @@ def main(seconds, history_days):
         assert download("route0.example.test",1024*1024)[0]==200
         compose("restart","-t","45","panel")
         wait_for(lambda:download("route0.example.test")[0]==200)
-        assert route(ids[0])["down_total"]>=before+1024*1024
+        wait_for(lambda:route(ids[0])["down_total"]>=before+1024*1024)
         print("PASS: graceful restart flushes counters and preserves config",flush=True)
 
         with tempfile.TemporaryDirectory(prefix='fluxgate-backup-test-') as directory:
@@ -276,7 +360,20 @@ def main(seconds, history_days):
             subprocess.run(['python3',str(ROOT/'deploy/update-helper.py'),'backup',str(archive)],input=json.dumps(['PANEL_TOKEN='+TOKEN,'PANEL_SECRET_PATH=admin']),env=env,text=True,check=True)
             with zipfile.ZipFile(archive) as saved:
                 assert 'panel.db' in saved.namelist() and saved.testzip() is None
+            # Open web readers before replacing the DB. Restoring must stop the
+            # web process first, or it can keep reading an unlinked old file.
+            saved_name=route(ids[0])['name']
+            api(f'/history/{ids[0]}?hours=24')
+            update(ids[0],name='Changed after snapshot')
+            before_restore=api('/system')['process_started_at']
+            req=urllib.request.Request('http://127.0.0.1:19389/admin/api/restore',data=archive.read_bytes(),headers={'Content-Type':'application/zip'})
+            with opener.open(req,timeout=30) as response: assert response.status==202
+            wait_for(lambda:api('/system')['process_started_at']!=before_restore,60)
+            assert route(ids[0])['name']==saved_name
+            restored_history=api(f'/history/{ids[0]}?hours=24')
+            assert sum(point[2] for point in restored_history)==route(ids[0])['down_total']
         print("PASS: updater creates a validated live backup using existing credentials",flush=True)
+        print('PASS: restore restarts agent AND web readers and retains session credentials',flush=True)
 
         subprocess.run(COMPOSE+["exec","-T","origin","node","/test/capacity.mjs"],check=True)
         wait_for(lambda:download("route0.example.test")[0]==200)

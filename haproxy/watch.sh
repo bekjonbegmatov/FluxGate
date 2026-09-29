@@ -9,12 +9,21 @@ reload_request=${config%.cfg}.reload-request
 reload_ready=${config%.cfg}.reload-ready
 restart_request=${config%.cfg}.restart-request
 child=''
+watchdog=''
+watchdog_binary=${FLUXGATE_WATCHDOG:-/usr/local/bin/fluxgate-watchdog}
 stopping=0
 stop() {
   stopping=1
   if [[ -n "$child" ]]; then kill -TERM "$child" 2>/dev/null || true; fi
+  if [[ -n "$watchdog" ]]; then kill -TERM "$watchdog" 2>/dev/null || true; fi
 }
 trap stop TERM INT
+start_watchdog() {
+  PANEL_DATA="$(dirname "$config")" PANEL_HAPROXY_MASTER_SOCKET="$master_socket" "$watchdog_binary" --watchdog &
+  watchdog=$!
+}
+[[ -x "$watchdog_binary" ]] || { echo 'FluxGate quota watchdog binary missing' >&2; exit 1; }
+start_watchdog
 while [[ $stopping == 0 && ! -s "$config" ]]; do sleep 1; done
 [[ $stopping == 0 ]] || exit 0
 haproxy -c -f "$config"
@@ -24,6 +33,11 @@ child=$!
 while [[ $stopping == 0 ]] && kill -0 "$child" 2>/dev/null; do
   sleep 1
   [[ $stopping == 0 ]] || break
+  if ! kill -0 "$watchdog" 2>/dev/null; then
+    wait "$watchdog" || true
+    echo 'Restarting quota watchdog' >&2
+    start_watchdog
+  fi
   if [[ -f "$restart_request" ]]; then
     # The panel writes this after draining and attempting its final commit.
     # Storage failures are logged by the panel and can lose unsaved deltas.
@@ -62,6 +76,8 @@ while [[ $stopping == 0 ]] && kill -0 "$child" 2>/dev/null; do
 done
 status=0
 wait "$child" || status=$?
+kill -TERM "$watchdog" 2>/dev/null || true
+wait "$watchdog" || true
 [[ $stopping == 1 ]] && exit 0
 # A clean but unexpected master exit must also restart the systemd service.
 [[ $status != 0 ]] || status=1

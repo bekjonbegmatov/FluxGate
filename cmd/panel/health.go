@@ -20,6 +20,11 @@ func (a *App) healthAPI(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}
+	// TCP accept alone does not prove that the TLS/relay/HTTP chain responds.
+	if last := a.publicProbe.lastOK.Load(); last == 0 || time.Since(time.Unix(last, 0)) > 45*time.Second {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
 	// Check both services, not only that the SPA is being served from disk.
 	addresses := []struct{ network, address string }{{"unix", filepath.Join(a.data, "haproxy.sock")}, {"tcp", "127.0.0.1:443"}, {"tcp", "127.0.0.1:8181"}}
 	if !a.directMode() {

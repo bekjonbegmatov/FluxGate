@@ -260,6 +260,12 @@ func (a *App) stageRestore(src io.Reader) (string, error) {
 		}
 	}
 	var mode string
+	var directLimits string
+	if e = db.QueryRow("SELECT value FROM settings WHERE key='direct_limits'").Scan(&directLimits); e != nil && e != sql.ErrNoRows {
+		return "", e
+	} else if e == nil && directLimits != "true" && directLimits != "false" {
+		return "", fmt.Errorf("invalid direct_limits in backup")
+	}
 	if e = db.QueryRow("SELECT value FROM settings WHERE key='proxy_mode'").Scan(&mode); e != nil && e != sql.ErrNoRows {
 		return "", e
 	} else if e == nil && !validProxyMode(mode) {

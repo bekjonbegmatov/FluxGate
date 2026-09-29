@@ -121,6 +121,15 @@ func (a *App) systemAPI(w http.ResponseWriter, r *http.Request) {
 	}
 	stats := readHostStats()
 	stats["process_started_at"] = a.start.UTC().Format(time.RFC3339Nano)
+	stats["agent_pid"] = os.Getpid()
+	stats["public_https_last_ok_unix"] = a.publicProbe.lastOK.Load()
+	stats["public_https_failures"] = a.publicProbe.failures.Load()
+	stats["public_https_last_ms"] = float64(a.publicProbe.lastNS.Load()) / 1e6
+	stats["process_architecture"] = "supervisor/web/agent"
+	a.mu.RLock()
+	stats["direct_limits"] = a.directLimits
+	a.mu.RUnlock()
+	stats["quota_watchdog_ready"] = a.persistenceFresh(time.Now()) && a.directLastOK.Load() > 0 && time.Since(time.Unix(a.directLastOK.Load(), 0)) <= directLeaseTimeout
 	direct := a.directMode()
 	stats["proxy_mode"] = "relay"
 	if direct {
@@ -134,6 +143,7 @@ func (a *App) systemAPI(w http.ResponseWriter, r *http.Request) {
 	runtime.ReadMemStats(&memory)
 	stats["heap_bytes"] = memory.HeapAlloc
 	active, paused, quota := 0, 0, 0
+	quotasEnabled := a.quotasEnabled()
 	var pending int64
 	for _, s := range a.routeStates() {
 		s.mu.Lock()
@@ -142,7 +152,7 @@ func (a *App) systemAPI(w http.ResponseWriter, r *http.Request) {
 		if s.Route.Paused {
 			paused++
 		}
-		if !direct && s.blocked() {
+		if quotasEnabled && s.blocked() {
 			quota++
 		}
 		s.mu.Unlock()
@@ -155,6 +165,11 @@ func (a *App) systemAPI(w http.ResponseWriter, r *http.Request) {
 	stats["traffic_flush_last_ms"] = float64(a.flushLastNS.Load()) / 1e6
 	stats["traffic_flush_errors"] = a.flushErrors.Load()
 	stats["max_client_connections"] = a.maxConnections
+	stats["public_connections"] = a.publicConnections.Load()
+	stats["public_peak_connections"] = a.publicPeak.Load()
+	if fds, err := os.ReadDir("/proc/self/fd"); err == nil {
+		stats["agent_open_fds"] = len(fds)
+	}
 	for _, name := range []string{"panel.db", "panel.db-wal", "panel.db-shm"} {
 		if f, err := os.Stat(filepath.Join(a.data, name)); err == nil {
 			stats[name+"_bytes"] = f.Size()

@@ -37,6 +37,9 @@ func TestBackupRestoreRoundTrip(t *testing.T) {
 	if e = a.setSetting("proxy_mode", "direct"); e != nil {
 		t.Fatal(e)
 	}
+	if e = a.setSetting("direct_limits", "true"); e != nil {
+		t.Fatal(e)
+	}
 	routeIdentity := Route{ID: 1}
 	if e = a.ensureMeterID(&routeIdentity); e != nil {
 		t.Fatal(e)
@@ -73,6 +76,9 @@ func TestBackupRestoreRoundTrip(t *testing.T) {
 	}
 	defer restored.Close()
 	other.db = restored
+	if got := other.getSetting("direct_limits", ""); got != "true" {
+		t.Fatalf("direct limits lost: %q", got)
+	}
 	if got := other.getSetting("proxy_mode", ""); got != "direct" {
 		t.Fatalf("proxy mode lost: %q", got)
 	}

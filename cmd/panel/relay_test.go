@@ -35,6 +35,34 @@ func (*memoryConn) SetDeadline(time.Time) error      { return nil }
 func (*memoryConn) SetReadDeadline(time.Time) error  { return nil }
 func (*memoryConn) SetWriteDeadline(time.Time) error { return nil }
 
+type deadlineConn struct {
+	memoryConn
+	readAt, writeAt time.Time
+}
+
+func (c *deadlineConn) SetReadDeadline(t time.Time) error  { c.readAt = t; return nil }
+func (c *deadlineConn) SetWriteDeadline(t time.Time) error { c.writeAt = t; return nil }
+
+func TestTLSDrainCannotBeOverwrittenByNormalDeadline(t *testing.T) {
+	up, client := &deadlineConn{}, &deadlineConn{}
+	d := &relayDrain{upstream: up, client: client}
+	r, w := &drainReadConn{Conn: up, drain: d}, &drainWriteConn{Conn: client, drain: d}
+	far := time.Now().Add(time.Hour)
+	r.SetReadDeadline(far)
+	w.SetWriteDeadline(far)
+	if up.readAt != far || client.writeAt != far {
+		t.Fatal("normal tunnel idle changed")
+	}
+	d.begin()
+	r.SetReadDeadline(far)
+	w.SetWriteDeadline(far)
+	for _, deadline := range []time.Time{up.readAt, client.writeAt} {
+		if time.Until(deadline) > relayHalfCloseIdleTimeout || time.Until(deadline) < relayHalfCloseIdleTimeout-time.Second {
+			t.Fatal("drain deadline overwritten", deadline)
+		}
+	}
+}
+
 func trafficApp(t *testing.T) (*App, *RouteState) {
 	t.Helper()
 	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "test.db"))

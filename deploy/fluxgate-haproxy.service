@@ -8,6 +8,7 @@ Type=simple
 Environment=FLUXGATE_CONFIG=/var/lib/fluxgate/haproxy.cfg
 Environment=FLUXGATE_PID=/run/fluxgate/haproxy.pid
 Environment=FLUXGATE_MASTER_GROUP=fluxgate
+Environment=FLUXGATE_WATCHDOG=/usr/local/bin/fluxgate-panel
 RuntimeDirectory=fluxgate
 ExecStart=/usr/local/libexec/fluxgate-watch
 Restart=always

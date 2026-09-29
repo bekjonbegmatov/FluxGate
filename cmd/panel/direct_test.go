@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"net"
 	"net/http/httptest"
@@ -11,6 +12,107 @@ import (
 	"testing"
 	"time"
 )
+
+func TestDirectCollectionContinuesWhileWriterBlocked(t *testing.T) {
+	a, s, backend := directApp(t)
+	now := time.Now()
+	a.observeDirect("worker", map[string]directCounter{backend: {down: 100}}, now)
+	conn, err := a.db.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	done := make(chan error, 1)
+	go func() { done <- a.flushTraffic(now) }()
+	deadline := time.Now().Add(2 * time.Second)
+	for a.db.Stats().WaitCount == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if a.db.Stats().WaitCount == 0 {
+		t.Fatal("writer did not reach DB")
+	}
+	observed := make(chan struct{})
+	go func() {
+		a.observeDirect("worker", map[string]directCounter{backend: {down: 250}}, now)
+		close(observed)
+	}()
+	select {
+	case <-observed:
+	case <-time.After(time.Second):
+		t.Fatal("SQL blocked direct collection")
+	}
+	conn.Close()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if s.pendingDown != 150 {
+		t.Fatalf("lost concurrent delta: %d", s.pendingDown)
+	}
+	var checkpoint int64
+	if err := a.db.QueryRow("SELECT down FROM direct_checkpoints").Scan(&checkpoint); err != nil || checkpoint != 100 {
+		t.Fatalf("checkpoint ahead of totals: %d %v", checkpoint, err)
+	}
+	if !a.directWorkerPending("worker") {
+		t.Fatal("prematurely released draining worker")
+	}
+	if err := a.flushTraffic(now); err != nil {
+		t.Fatal(err)
+	}
+	if a.directWorkerPending("worker") {
+		t.Fatal("checkpoint not committed")
+	}
+	if err := a.db.QueryRow("SELECT down FROM direct_checkpoints").Scan(&checkpoint); err != nil || checkpoint != 250 {
+		t.Fatalf("checkpoint=%d %v", checkpoint, err)
+	}
+	if err := a.db.QueryRow("SELECT SUM(down) FROM samples").Scan(&checkpoint); err != nil || checkpoint != 250 {
+		t.Fatalf("samples=%d %v", checkpoint, err)
+	}
+}
+
+func TestDirectObservationDuringDeletionRollback(t *testing.T) {
+	a, s, backend := directApp(t)
+	a.observeDirect("worker", map[string]directCounter{backend: {down: 100}}, time.Now())
+	delete(a.routes, 1)
+	a.deleting = map[int64]*RouteState{1: s}
+	a.observeDirect("worker", map[string]directCounter{backend: {down: 250}}, time.Now())
+	a.routes[1] = s
+	delete(a.deleting, 1)
+	if err := a.flushTraffic(time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if s.Route.DownTotal != 250 {
+		t.Fatal("rollback lost direct traffic", s.Route.DownTotal)
+	}
+}
+
+func TestDirectQuotaOptInAndTopup(t *testing.T) {
+	a, s, backend := directApp(t)
+	s.Route.DailyLimit = 100
+	a.observeDirect("worker", map[string]directCounter{backend: {down: 101}}, time.Now())
+	if !a.allowedDirectBackends()[backend] {
+		t.Fatal("legacy direct unexpectedly limited")
+	}
+	a.directLimits = true
+	if a.allowedDirectBackends()[backend] {
+		t.Fatal("daily quota bypassed")
+	}
+	s.Daily.Extra = 100
+	if !a.allowedDirectBackends()[backend] {
+		t.Fatal("topup did not reopen route")
+	}
+	s.Route.MonthlyLimit = 50
+	if a.allowedDirectBackends()[backend] {
+		t.Fatal("monthly quota bypassed")
+	}
+	s.Monthly.Extra = 100
+	if !a.allowedDirectBackends()[backend] {
+		t.Fatal("monthly topup ignored")
+	}
+	s.Route.Paused = true
+	if a.allowedDirectBackends()[backend] {
+		t.Fatal("paused route reopened")
+	}
+}
 
 func directApp(t *testing.T) (*App, *RouteState, string) {
 	t.Helper()
@@ -231,33 +333,37 @@ func TestProxyModeSettingsValidationPersistenceAndRollback(t *testing.T) {
 		t.Fatal(err)
 	}
 	fakeMeterSocket(t, dir)
-	put := func(mode string) int {
+	put := func(mode string, limits ...bool) int {
 		w := httptest.NewRecorder()
-		a.settingsAPI(w, httptest.NewRequest("PUT", "/admin/api/settings", strings.NewReader(`{"proxy_mode":"`+mode+`","tg_api":"https://api.telegram.org","fallback_html":"ok"}`)))
+		field := ""
+		if len(limits) > 0 {
+			field = fmt.Sprintf(`,"direct_limits":%t`, limits[0])
+		}
+		a.settingsAPI(w, httptest.NewRequest("PUT", "/admin/api/settings", strings.NewReader(`{"proxy_mode":"`+mode+`","tg_api":"https://api.telegram.org","fallback_html":"ok"`+field+`}`)))
 		return w.Code
 	}
 	if got := put("invalid"); got != 400 {
 		t.Fatal(got)
 	}
-	if got := put("direct"); got != 200 {
+	if got := put("direct", true); got != 200 {
 		t.Fatal(got)
 	}
-	if a.getSetting("proxy_mode", "") != "direct" || !a.directMode() {
+	if a.getSetting("proxy_mode", "") != "direct" || !a.directMode() || a.getSetting("direct_limits", "") != "true" || !a.directLimits {
 		t.Fatal("mode not persisted")
 	}
 	w := httptest.NewRecorder()
 	a.settingsAPI(w, httptest.NewRequest("PUT", "/admin/api/settings", strings.NewReader(`{"tg_api":"https://api.telegram.org"}`)))
-	if w.Code != 200 || !a.directMode() {
+	if w.Code != 200 || !a.directMode() || !a.directLimits {
 		t.Fatal("old client reset mode")
 	}
 	if _, err := a.db.Exec("CREATE TRIGGER reject_settings BEFORE INSERT ON settings BEGIN SELECT RAISE(FAIL,'injected'); END"); err != nil {
 		t.Fatal(err)
 	}
-	if got := put("relay"); got != 500 {
+	if got := put("relay", false); got != 500 {
 		t.Fatal(got)
 	}
 	raw, _ := os.ReadFile(filepath.Join(dir, "haproxy.cfg"))
-	if !a.directMode() || !strings.Contains(string(raw), "frontend public_direct") {
+	if !a.directMode() || !a.directLimits || !strings.Contains(string(raw), "frontend public_direct") {
 		t.Fatal("failed update did not restore active config")
 	}
 }

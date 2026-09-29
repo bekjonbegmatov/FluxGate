@@ -24,6 +24,11 @@ func (a *App) directMode() bool {
 	defer a.mu.RUnlock()
 	return a.proxyMode == "direct"
 }
+func (a *App) quotasEnabled() bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.proxyMode != "direct" || a.directLimits
+}
 func routeBackend(r Route, direct bool) string {
 	if direct {
 		return fmt.Sprintf("direct_%d_%s", r.ID, r.MeterID)
@@ -58,8 +63,10 @@ type directMeter struct {
 	lastErrorLog  time.Time
 	lastReloadAck string
 	recoverOld    bool
-	// These maps are protected by stateMu. Checkpoints are committed in the
+	// dataMu covers checkpoints AND the corresponding route counter snapshot.
+	// Never hold it during SQL or network I/O. Checkpoints are committed in the
 	// SAME transaction as totals/samples, so a panel restart cannot double bill.
+	dataMu  sync.Mutex
 	last    map[directKey]directCounter
 	pending map[directKey]directCounter
 }
@@ -122,7 +129,7 @@ func (w *meterWorker) command(command string) ([]byte, error) {
 		return nil, err
 	}
 	var out bytes.Buffer
-	for out.Len() < 8<<20 {
+	for out.Len() < maxRuntimeResponse {
 		b, err := w.reader.ReadByte()
 		if err != nil {
 			return nil, err
@@ -209,14 +216,23 @@ func parseDirectStats(raw []byte) (map[string]directCounter, error) {
 }
 
 func (a *App) observeDirect(worker string, observed map[string]directCounter, now time.Time) {
-	a.stateMu.Lock()
-	defer a.stateMu.Unlock()
+	a.direct.dataMu.Lock()
+	defer a.direct.dataMu.Unlock()
 	if a.direct.last == nil {
 		a.direct.last = map[directKey]directCounter{}
 		a.direct.pending = map[directKey]directCounter{}
 	}
 	routes := map[string]*RouteState{}
-	for _, s := range a.routeStates() {
+	a.mu.RLock()
+	states := make([]*RouteState, 0, len(a.routes)+len(a.deleting))
+	for _, s := range a.routes {
+		states = append(states, s)
+	}
+	for _, s := range a.deleting {
+		states = append(states, s)
+	}
+	a.mu.RUnlock()
+	for _, s := range states {
 		s.mu.Lock()
 		routes[routeBackend(s.Route, true)] = s
 		s.mu.Unlock()
@@ -230,6 +246,10 @@ func (a *App) observeDirect(worker string, observed map[string]directCounter, no
 		up, down := deltaCounter(current.up, previous.up), deltaCounter(current.down, previous.down)
 		if s := routes[backend]; s != nil {
 			s.mu.Lock()
+			if s.deleted {
+				s.mu.Unlock()
+				continue
+			}
 			s.Route.UpTotal += up
 			s.Route.DownTotal += down
 			s.pendingUp += up
@@ -258,7 +278,7 @@ func (a *App) allowedDirectBackends() map[string]bool {
 	if a.proxyMode == "direct" {
 		for _, s := range a.routes {
 			s.mu.Lock()
-			allowed[routeBackend(s.Route, true)] = !s.Route.Paused
+			allowed[routeBackend(s.Route, true)] = !s.Route.Paused && (!a.directLimits || !s.blocked())
 			s.mu.Unlock()
 		}
 	}
@@ -271,7 +291,9 @@ func (a *App) collectDirectTraffic(now time.Time) {
 	if a.direct.workers == nil {
 		a.direct.workers = map[string]*meterWorker{}
 	}
+	healthy := true
 	report := func(err error) {
+		healthy = false
 		a.directErrors.Add(1)
 		if now.Sub(a.direct.lastErrorLog) >= time.Minute {
 			log.Printf("direct traffic collection: %v", err)
@@ -315,7 +337,7 @@ func (a *App) collectDirectTraffic(now time.Time) {
 			continue
 		}
 		if key == currentKey {
-			a.directLastOK.Store(now.Unix())
+			a.observeCapacity(raw)
 		}
 		a.observeDirect(key, observed, now)
 		if !w.activated && !w.stopping && bytes.Contains(raw, []byte("public_direct,FRONTEND,")) && a.directMode() {
@@ -325,17 +347,20 @@ func (a *App) collectDirectTraffic(now time.Time) {
 			w.activated = true
 		}
 		// Pause/delete and returning to relay also terminate old direct tunnels.
-		// No quota enforcement is attempted in direct mode.
 		allowed := a.allowedDirectBackends()
+		limited, shaped := a.directPolicy()
 		for backend := range observed {
-			if !allowed[backend] {
-				_, _ = w.command("set server " + backend + "/target state maint")
-				_, _ = w.command("shutdown sessions server " + backend + "/target")
+			blocked := !allowed[backend] || (limited[backend] && !a.persistenceFresh(time.Now())) || (w.stopping && shaped[backend])
+			if blocked || (limited[backend] && !w.stopping) {
+				if err := enforceDirectBackend(w.command, backend, blocked); err != nil {
+					report(err)
+				}
 			}
 		}
 		if w.stopping && w.connections == 0 {
-			if e = a.flushTraffic(now); e != nil {
-				report(e)
+			// The independent writer releases this guard after committing the
+			// last observation. A slow/failed DB must not stop stats collection.
+			if a.directWorkerPending(key) {
 				continue
 			}
 			w.conn.Close()
@@ -344,6 +369,19 @@ func (a *App) collectDirectTraffic(now time.Time) {
 	}
 	if a.direct.recoverOld {
 		a.recoverDirectWorkers(now, report)
+	}
+	if healthy && currentKey != "" {
+		a.directLastOK.Store(time.Now().Unix())
+	}
+	if a.quotasEnabled() {
+		for _, s := range a.routeStates() {
+			s.mu.Lock()
+			blocked := s.blocked()
+			s.mu.Unlock()
+			if blocked {
+				a.exhaust(s)
+			}
+		}
 	}
 	_, pinned := a.direct.workers[currentKey]
 	if !pinned && !a.directMode() {
@@ -435,10 +473,14 @@ func (a *App) recoverDirectWorkers(now time.Time, report func(error)) {
 		a.observeDirect(fmt.Sprintf("%s/%d/%d", values["node"], start, pid), observed, now)
 		// Return-to-relay/pause/delete must also apply to these older workers.
 		allowed := a.allowedDirectBackends()
+		limited, shaped := a.directPolicy()
 		for backend := range observed {
-			if !allowed[backend] || a.restartRequested.Load() {
-				_, _ = haproxyCommand(path, prefix+"set server "+backend+"/target state maint")
-				_, _ = haproxyCommand(path, prefix+"shutdown sessions server "+backend+"/target")
+			blocked := !allowed[backend] || a.restartRequested.Load() || shaped[backend] || (limited[backend] && !a.persistenceFresh(time.Now()))
+			if blocked {
+				command := func(s string) ([]byte, error) { return haproxyCommand(path, prefix+s) }
+				if err := enforceDirectBackend(command, backend, blocked); err != nil {
+					report(err)
+				}
 			}
 		}
 	}
@@ -447,18 +489,28 @@ func (a *App) recoverDirectWorkers(now time.Time, report func(error)) {
 
 // Caller holds stateMu. Checkpoints and route totals must never be committed
 // separately, including on backup and graceful shutdown.
-func (a *App) saveDirectCheckpoints(tx *sql.Tx, now time.Time) error {
-	for k, v := range a.direct.pending {
+func saveDirectCheckpoints(tx *sql.Tx, pending map[directKey]directCounter, now time.Time) error {
+	for k, v := range pending {
 		_, err := tx.Exec(`INSERT INTO direct_checkpoints(worker,backend,up,down,seen) VALUES(?,?,?,?,?) ON CONFLICT(worker,backend) DO UPDATE SET up=excluded.up,down=excluded.down,seen=excluded.seen`, k.worker, k.backend, v.up, v.down, v.seen)
 		if err != nil {
 			return err
 		}
 	}
-	if len(a.direct.pending) > 0 {
+	if len(pending) > 0 {
 		_, err := tx.Exec("DELETE FROM direct_checkpoints WHERE seen<?", now.Add(-48*time.Hour).Unix())
 		return err
 	}
 	return nil
+}
+func (a *App) directWorkerPending(worker string) bool {
+	a.direct.dataMu.Lock()
+	defer a.direct.dataMu.Unlock()
+	for key := range a.direct.pending {
+		if key.worker == worker {
+			return true
+		}
+	}
+	return false
 }
 func (a *App) closeDirectMeter() {
 	a.direct.mu.Lock()

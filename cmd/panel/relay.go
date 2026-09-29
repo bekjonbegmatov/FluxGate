@@ -19,19 +19,33 @@ import (
 // footprint bounded; 10,000 tunnels used to pin 1.22 GiB in 64 KiB buffers.
 const relayBufferSize = 16 * 1024
 const relayIdleTimeout = time.Hour
+const relayHalfCloseIdleTimeout = 30 * time.Second
 
 var relayBuffers = sync.Pool{New: func() any { b := make([]byte, relayBufferSize); return &b }}
 
 // Closing either side interrupts writes and rate-limit waits on the other.
 type relayConn struct {
 	net.Conn
-	upstream net.Conn
-	done     chan struct{}
-	once     sync.Once
+	upstream  net.Conn
+	done      chan struct{}
+	once      sync.Once
+	tlsStream bool
 }
 
 func (c *relayConn) Close() error {
-	c.once.Do(func() { close(c.done); _ = c.Conn.Close(); _ = c.upstream.Close() })
+	c.once.Do(func() {
+		close(c.done)
+		// Both pumps have drained (or setup was cancelled). An upstream FIN
+		// alone can leave HAProxy's inner TLS/WebSocket stream half-open for
+		// the full tunnel timeout after the outer client has disappeared.
+		// Reset ONLY the inner hop; keep a normal close towards the outer
+		// frontend so already forwarded response bytes are not discarded.
+		if tcp, ok := c.upstream.(*net.TCPConn); ok {
+			_ = tcp.SetLinger(0)
+		}
+		_ = c.upstream.Close()
+		_ = c.Conn.Close()
+	})
 	return nil
 }
 
@@ -159,7 +173,7 @@ func (a *App) handleConn(s *RouteState, client net.Conn) {
 	if err != nil {
 		return
 	}
-	pair := &relayConn{Conn: client, upstream: upstream, done: make(chan struct{})}
+	pair := &relayConn{Conn: client, upstream: upstream, done: make(chan struct{}), tlsStream: true}
 	defer pair.Close()
 	if s != nil {
 		s.mu.Lock()
@@ -203,12 +217,25 @@ func (a *App) rejectConn(client net.Conn, r Route) {
 }
 func (a *App) relayDuplex(s *RouteState, pair *relayConn) {
 	done := make(chan struct{}, 2)
+	drain := &relayDrain{upstream: pair.upstream, client: pair.Conn}
 	pump := func(dst, src net.Conn, up bool) {
-		err := a.copyMetered(s, dst, src, up, pair.done)
+		copyDst, copySrc := dst, src
+		if pair.tlsStream && !up {
+			copySrc = &drainReadConn{Conn: src, drain: drain}
+			copyDst = &drainWriteConn{Conn: dst, drain: drain}
+		}
+		err := a.copyMetered(s, copyDst, copySrc, up, pair.done)
 		if err != nil {
 			pair.abort()
-		} else if tcp, ok := dst.(*net.TCPConn); ok {
-			_ = tcp.CloseWrite()
+		} else if up && pair.tlsStream {
+			// TLS close_notify, if present, has already been forwarded. Do not
+			// send a transport FIN into the TLS frontend: HAProxy can retain an
+			// upgraded upstream after that FIN even after Go closes its socket.
+			// Drain responses with a short IDLE timeout, not a total deadline;
+			// active large responses still finish. Truncated TLS then gets RST.
+			drain.begin()
+		} else if half, ok := dst.(interface{ CloseWrite() error }); ok {
+			_ = half.CloseWrite()
 		}
 		done <- struct{}{}
 	}
@@ -216,6 +243,55 @@ func (a *App) relayDuplex(s *RouteState, pair *relayConn) {
 	pump(pair.Conn, pair.upstream, false)
 	<-done
 	<-done
+}
+
+type relayDrain struct {
+	mu               sync.Mutex
+	active           bool
+	upstream, client net.Conn
+}
+
+func (d *relayDrain) begin() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.active = true
+	deadline := time.Now().Add(relayHalfCloseIdleTimeout)
+	_ = d.upstream.SetReadDeadline(deadline)
+	_ = d.client.SetWriteDeadline(deadline)
+}
+func (d *relayDrain) deadline(t time.Time) time.Time {
+	if d.active {
+		return minTime(t, time.Now().Add(relayHalfCloseIdleTimeout))
+	}
+	return t
+}
+func minTime(a, b time.Time) time.Time {
+	if a.IsZero() || b.Before(a) {
+		return b
+	}
+	return a
+}
+
+type drainReadConn struct {
+	net.Conn
+	drain *relayDrain
+}
+
+func (c *drainReadConn) SetReadDeadline(t time.Time) error {
+	c.drain.mu.Lock()
+	defer c.drain.mu.Unlock()
+	return c.Conn.SetReadDeadline(c.drain.deadline(t))
+}
+
+type drainWriteConn struct {
+	net.Conn
+	drain *relayDrain
+}
+
+func (c *drainWriteConn) SetWriteDeadline(t time.Time) error {
+	c.drain.mu.Lock()
+	defer c.drain.mu.Unlock()
+	return c.Conn.SetWriteDeadline(c.drain.deadline(t))
 }
 
 // take applies one shared bucket per route and direction, with s.mu held.
@@ -428,6 +504,7 @@ func (a *App) tick(ctx context.Context) {
 	run(10*time.Second, a.collectRequestStats)
 	run(time.Second, a.collectDirectTraffic)
 	run(time.Second, a.sampleRates)
+	run(15*time.Second, a.probePublic)
 	run(time.Minute, a.checkRentals)
 	run(10*time.Second, func(_ time.Time) {
 		limit := make(chan struct{}, 16)

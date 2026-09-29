@@ -61,6 +61,7 @@ func (a *App) writeConfig() error {
 	a.mu.RLock()
 	domain := a.domain
 	direct := a.proxyMode == "direct"
+	directLimits := a.directLimits
 	routes := make([]Route, 0, len(a.routes))
 	for _, s := range a.routes {
 		s.mu.Lock()
@@ -138,6 +139,21 @@ func (a *App) writeConfig() error {
 		if direct && r.Paused {
 			fmt.Fprintln(&b, "  http-request deny deny_status 503")
 		}
+		if direct && directLimits {
+			if r.UpBPS > 0 || r.DownBPS > 0 {
+				fmt.Fprintln(&b, "  stick-table type integer size 1 expire 1m store bytes_in_rate(1s),bytes_out_rate(1s)")
+			}
+			if r.UpBPS > 0 {
+				fmt.Fprintf(&b, "  filter bwlim-in upload limit %d key int(1)\n  http-request set-bandwidth-limit upload\n", r.UpBPS)
+			}
+			if r.DownBPS > 0 {
+				fmt.Fprintf(&b, "  filter bwlim-out download limit %d key int(1)\n  http-request set-bandwidth-limit download\n", r.DownBPS)
+			}
+			if r.DailyLimit > 0 || r.MonthlyLimit > 0 {
+				// Watchdog can recover this policy even when the agent is dead.
+				fmt.Fprintf(&b, "  # fluxgate-quota %s\n", routeBackend(r, true))
+			}
+		}
 		fmt.Fprintf(&b, "  server target %s", net.JoinHostPort(r.IP, fmt.Sprint(r.Port)))
 		if r.TLS {
 			fmt.Fprint(&b, " ssl")
@@ -146,6 +162,9 @@ func (a *App) writeConfig() error {
 			} else {
 				fmt.Fprint(&b, " verify none sni ssl_fc_sni")
 			}
+		}
+		if direct && directLimits && (r.DailyLimit > 0 || r.MonthlyLimit > 0) {
+			fmt.Fprint(&b, " disabled") // fail closed until fresh stats are reconciled
 		}
 		fmt.Fprintln(&b, " check")
 	}

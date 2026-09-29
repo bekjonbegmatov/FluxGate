@@ -61,8 +61,7 @@ func (a *App) quiesceHAProxy() {
 			if len(row) < 2 || row[1] != "BACKEND" || (!strings.HasPrefix(row[0], "direct_") && !strings.HasPrefix(row[0], "target_")) {
 				continue
 			}
-			_, _ = w.command("set server " + row[0] + "/target state maint")
-			_, _ = w.command("shutdown sessions server " + row[0] + "/target")
+			_ = enforceDirectBackend(w.command, row[0], true)
 		}
 	}
 }

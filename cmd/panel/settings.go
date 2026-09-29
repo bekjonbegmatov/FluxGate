@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -13,6 +14,7 @@ func (a *App) updateSettings(w http.ResponseWriter, r *http.Request) {
 	var v struct {
 		Domain       string  `json:"domain"`
 		ProxyMode    *string `json:"proxy_mode"`
+		DirectLimits *bool   `json:"direct_limits"`
 		FallbackHTML string  `json:"fallback_html"`
 		TGAPI        string  `json:"tg_api"`
 		TGChat       string  `json:"tg_chat"`
@@ -44,8 +46,13 @@ func (a *App) updateSettings(w http.ResponseWriter, r *http.Request) {
 	defer a.stateMu.Unlock()
 	a.mu.RLock()
 	oldDomain, oldMode, oldTG := a.domain, a.proxyMode, a.tg
+	oldLimits := a.directLimits
 	a.mu.RUnlock()
 	mode := oldMode
+	limits := oldLimits
+	if v.DirectLimits != nil {
+		limits = *v.DirectLimits
+	}
 	if mode == "" {
 		mode = "relay"
 	}
@@ -86,13 +93,15 @@ func (a *App) updateSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	changed := v.Domain != oldDomain || mode != oldMode
+	changed := v.Domain != oldDomain || mode != oldMode || limits != oldLimits
 	a.mu.Lock()
 	a.domain, a.proxyMode = v.Domain, mode
+	a.directLimits = limits
 	a.mu.Unlock()
 	rollback := func() {
 		a.mu.Lock()
 		a.domain, a.proxyMode = oldDomain, oldMode
+		a.directLimits = oldLimits
 		a.mu.Unlock()
 		if oldCert != nil {
 			_ = os.WriteFile(certPath, oldCert, 0600)
@@ -114,6 +123,7 @@ func (a *App) updateSettings(w http.ResponseWriter, r *http.Request) {
 		tg.BotToken = v.TGToken
 	}
 	values := map[string]string{"domain": v.Domain, "proxy_mode": mode, "fallback_html": v.FallbackHTML, "tg_api": tg.APIURL, "tg_chat": tg.ChatID}
+	values["direct_limits"] = strconv.FormatBool(limits)
 	if v.TGToken != "" {
 		values["tg_token"] = a.encrypt(tg.BotToken)
 	}

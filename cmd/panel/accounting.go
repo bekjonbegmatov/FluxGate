@@ -70,7 +70,12 @@ func (a *App) flushTraffic(now time.Time) (result error) {
 		retired  map[string]retiredPeriod
 	}
 	var batch []snapshot
-	direct := a.directMode()
+	a.direct.dataMu.Lock()
+	checkpoints := make(map[directKey]directCounter, len(a.direct.pending))
+	for k, v := range a.direct.pending {
+		checkpoints[k] = v
+	}
+	direct := !a.quotasEnabled()
 	for _, s := range a.routeStates() {
 		s.mu.Lock()
 		r := s.Route
@@ -91,7 +96,8 @@ func (a *App) flushTraffic(now time.Time) (result error) {
 		}
 		s.mu.Unlock()
 	}
-	if len(batch) == 0 && len(a.direct.pending) == 0 {
+	a.direct.dataMu.Unlock()
+	if len(batch) == 0 && len(checkpoints) == 0 {
 		return nil
 	}
 	tx, err := a.db.Begin()
@@ -121,18 +127,24 @@ func (a *App) flushTraffic(now time.Time) (result error) {
 			}
 		}
 	}
-	if err = a.saveDirectCheckpoints(tx, now); err != nil {
+	if err = saveDirectCheckpoints(tx, checkpoints, now); err != nil {
 		return err
 	}
 	if err = tx.Commit(); err != nil {
 		return err
 	}
-	clear(a.direct.pending)
+	a.direct.dataMu.Lock()
+	for key, value := range checkpoints {
+		if a.direct.pending[key] == value {
+			delete(a.direct.pending, key)
+		}
+	}
 	for key, value := range a.direct.last {
 		if value.seen < now.Add(-48*time.Hour).Unix() {
 			delete(a.direct.last, key)
 		}
 	}
+	a.direct.dataMu.Unlock()
 	for _, v := range batch {
 		v.s.mu.Lock()
 		v.s.pendingUp -= v.up
@@ -231,7 +243,7 @@ func (a *App) rollPeriods(now time.Time) error {
 			}
 			s.retired[kind+":"+previous.Key] = retiredPeriod{previous, reserved}
 			s.mu.Unlock()
-			if limit > 0 && !a.directMode() {
+			if limit > 0 && a.quotasEnabled() {
 				go a.notify(r, quotaResetMessage(kind, limit+p.Extra))
 			}
 		}

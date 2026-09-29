@@ -8,7 +8,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -76,6 +75,8 @@ func (a *App) adminServer() *http.Server {
 	mux := http.NewServeMux()
 	base := "/" + a.secretPath + "/"
 	mux.HandleFunc("/healthz", a.healthAPI)
+	// Only the private agent socket serves this; web never forwards this path.
+	mux.HandleFunc("/internal/lease", a.directLeaseAPI)
 	mux.HandleFunc(base+"api/login", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "POST" {
 			fail(w, 405, "method")
@@ -138,7 +139,6 @@ func (a *App) adminServer() *http.Server {
 	})
 	listen := env("PANEL_LISTEN", "0.0.0.0:9389")
 	server := &http.Server{Addr: listen, Handler: mux, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second}
-	log.Printf("panel listening on http://%s/%s/", listen, a.secretPath)
 	return server
 }
 func (a *App) auth(next http.HandlerFunc) http.HandlerFunc {
@@ -177,7 +177,7 @@ func (a *App) routesAPI(w http.ResponseWriter, r *http.Request) {
 			switch {
 			case v.Paused:
 				v.Status = "paused"
-			case a.proxyMode != "direct" && s.blocked():
+			case (a.proxyMode != "direct" || a.directLimits) && s.blocked():
 				v.Status = "quota"
 			case !s.healthy:
 				v.Status = "down"
@@ -380,11 +380,16 @@ func (a *App) routeAPI(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, v)
 	case "DELETE":
 		a.mu.Lock()
+		if a.deleting == nil {
+			a.deleting = map[int64]*RouteState{}
+		}
+		a.deleting[id] = s
 		delete(a.routes, id)
 		a.mu.Unlock()
 		if e = a.writeConfig(); e != nil {
 			a.mu.Lock()
 			a.routes[id] = s
+			delete(a.deleting, id)
 			a.mu.Unlock()
 			fail(w, 500, e.Error())
 			return
@@ -409,6 +414,7 @@ func (a *App) routeAPI(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			a.mu.Lock()
 			a.routes[id] = s
+			delete(a.deleting, id)
 			a.mu.Unlock()
 			_ = a.writeConfig()
 			fail(w, 500, err.Error())
@@ -420,6 +426,9 @@ func (a *App) routeAPI(w http.ResponseWriter, r *http.Request) {
 			_ = s.Listener.Close()
 		}
 		s.mu.Unlock()
+		a.mu.Lock()
+		delete(a.deleting, id)
+		a.mu.Unlock()
 		a.closeRouteConns(s)
 		a.historyEpoch.Add(1)
 		delete(a.lastStats, id)
@@ -516,6 +525,7 @@ func (a *App) settingsAPI(w http.ResponseWriter, r *http.Request) {
 			mode = "relay"
 		}
 		v := map[string]any{"domain": a.domain, "proxy_mode": mode, "timezone": a.location.String(), "fallback_html": a.fallback, "tg_api": a.tg.APIURL, "tg_chat": a.tg.ChatID, "tg_token_set": a.tg.BotToken != ""}
+		v["direct_limits"] = a.directLimits
 		a.mu.RUnlock()
 		writeJSON(w, 200, v)
 	case "PUT":
