@@ -88,15 +88,23 @@ func shutdownStoppedStreams(command func(string) ([]byte, error), backend string
 	if err != nil {
 		return err
 	}
-	for _, id := range ids {
-		out, err := command("shutdown session " + id)
+	// Keep each CLI request below the default HAProxy input buffer. At 100k
+	// streams, one socket round-trip per ID would stall quota enforcement.
+	for start := 0; start < len(ids); start += 64 {
+		end := min(start+64, len(ids))
+		commands := make([]string, 0, end-start)
+		for _, id := range ids[start:end] {
+			commands = append(commands, "shutdown session "+id)
+		}
+		out, err := command(strings.Join(commands, ";"))
 		if err != nil {
 			return err
 		}
-		reply := strings.TrimSpace(string(out))
 		// A stream can close naturally between the snapshot and command.
-		if reply != "" && reply != "No such session (use 'show sess')." {
-			return fmt.Errorf("HAProxy refused stopped-stream shutdown")
+		for _, reply := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+			if reply = strings.TrimSpace(reply); reply != "" && reply != "No such session (use 'show sess')." {
+				return fmt.Errorf("HAProxy refused stopped-stream shutdown")
+			}
 		}
 	}
 	return nil
@@ -235,7 +243,7 @@ func stopStaleDirect(data string, policy map[string]bool) error {
 			if !policy[backend] {
 				continue
 			}
-			command := func(s string) ([]byte, error) { return haproxyCommand(path, prefix+s) }
+			command := func(s string) ([]byte, error) { return haproxyCommand(path, workerCommands(prefix, s)) }
 			if err := enforceDirectBackend(command, backend, true); err != nil {
 				// One disappearing generation must not prevent protection of
 				// the other workers/routes. Retry failures on the next tick.

@@ -15,8 +15,14 @@ import (
 	"time"
 )
 
-// Bounded, including a short stream list at the configured 20k-client maximum.
-const maxRuntimeResponse = 32 << 20
+// Bounded, including a backend-filtered short stream list at the 100k ceiling.
+// Normal stats are small; this is not allocated eagerly.
+const maxRuntimeResponse = 128 << 20
+
+// The master interprets each semicolon-separated command independently.
+func workerCommands(prefix, commands string) string {
+	return prefix + strings.ReplaceAll(commands, ";", ";"+prefix)
+}
 
 func haproxyCommand(path, command string) ([]byte, error) {
 	c, err := net.DialTimeout("unix", path, 2*time.Second)

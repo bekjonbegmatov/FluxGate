@@ -73,7 +73,7 @@ func (a *App) routeStates() []*RouteState {
 	return out
 }
 func (a *App) startListeners() error {
-	l, err := net.Listen("tcp", "127.0.0.1:9999")
+	l, err := listenPrivateSocket(relaySocket(a.data, 0))
 	if err != nil {
 		return err
 	}
@@ -90,7 +90,7 @@ func (a *App) listenRoute(s *RouteState) error {
 	s.mu.Lock()
 	id := s.Route.ID
 	s.mu.Unlock()
-	l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", 10000+id))
+	l, err := listenPrivateSocket(relaySocket(a.data, id))
 	if err != nil {
 		return err
 	}
@@ -125,8 +125,16 @@ func (a *App) acceptRelay(l net.Listener, s *RouteState) {
 				continue
 			}
 			delay = 0
+			if !a.acquireRelay() {
+				_ = c.Close()
+				continue
+			}
 			a.relayWG.Add(1)
-			go func() { defer a.relayWG.Done(); a.handleConn(s, c) }()
+			go func() {
+				defer a.relayWG.Done()
+				defer a.relayAdmitted.Add(-1)
+				a.handleConn(s, c)
+			}()
 		}
 	}()
 }
@@ -169,7 +177,9 @@ func (a *App) handleConn(s *RouteState, client net.Conn) {
 			return
 		}
 	}
-	upstream, err := net.DialTimeout("tcp", "127.0.0.1:8443", 5*time.Second)
+	address, releaseIngress := a.relayIngress.acquire()
+	defer releaseIngress()
+	upstream, err := net.DialTimeout("tcp", address, 5*time.Second)
 	if err != nil {
 		return
 	}

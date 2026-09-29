@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -11,6 +12,43 @@ import (
 	"testing"
 	"time"
 )
+
+func TestStoppedStreamShutdownUsesBoundedBatches(t *testing.T) {
+	var raw strings.Builder
+	for i := 1; i <= 130; i++ {
+		fmt.Fprintf(&raw, "0x%x: be=direct_1_token\n", i)
+	}
+	var batches, sessions int
+	command := func(s string) ([]byte, error) {
+		if strings.HasPrefix(s, "show sess ") {
+			return []byte(raw.String()), nil
+		}
+		commands := strings.Split(s, ";")
+		if len(commands) > 64 || len(s) > 4096 {
+			t.Fatal("unbounded CLI request")
+		}
+		batches++
+		sessions += len(commands)
+		return []byte("\nNo such session (use 'show sess').\n\n"), nil
+	}
+	if err := shutdownStoppedStreams(command, "direct_1_token"); err != nil {
+		t.Fatal(err)
+	}
+	if batches != 3 || sessions != 130 {
+		t.Fatal(batches, sessions)
+	}
+	if got := workerCommands("@!123 ", "shutdown session 0x1;shutdown session 0x2"); got != "@!123 shutdown session 0x1;@!123 shutdown session 0x2" {
+		t.Fatal(got)
+	}
+	if err := shutdownStoppedStreams(func(s string) ([]byte, error) {
+		if strings.HasPrefix(s, "show sess ") {
+			return []byte(raw.String()), nil
+		}
+		return []byte("\nUnknown command\n"), nil
+	}, "direct_1_token"); err == nil {
+		t.Fatal("batch failure acknowledged")
+	}
+}
 
 func TestReportPoolReadOnlyAndIndependent(t *testing.T) {
 	dir := t.TempDir()
@@ -124,9 +162,7 @@ func TestStoppedDirectBackendTerminatesItsStreams(t *testing.T) {
 			return []byte("Proxy is disabled.\n"), nil
 		case s == "show sess backend direct_1_token":
 			return []byte("0x1234: proto=tcpv4 fe=public_direct be=direct_1_token srv=target\n0x5678: proto=tcpv4 be=direct_1_token srv=target\n"), nil
-		case s == "shutdown session 0x1234":
-			return nil, nil
-		case s == "shutdown session 0x5678":
+		case s == "shutdown session 0x1234;shutdown session 0x5678":
 			return []byte("No such session (use 'show sess').\n"), nil
 		default:
 			t.Fatalf("unexpected command %q", s)
@@ -136,7 +172,7 @@ func TestStoppedDirectBackendTerminatesItsStreams(t *testing.T) {
 	if err := enforceDirectBackend(command, "direct_1_token", true); err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(commands, []string{"set server direct_1_token/target state maint", "shutdown sessions server direct_1_token/target", "show sess backend direct_1_token", "shutdown session 0x1234", "shutdown session 0x5678"}) {
+	if !reflect.DeepEqual(commands, []string{"set server direct_1_token/target state maint", "shutdown sessions server direct_1_token/target", "show sess backend direct_1_token", "shutdown session 0x1234;shutdown session 0x5678"}) {
 		t.Fatal(commands)
 	}
 	// Disabled is not an acknowledgement when trying to reopen a route.

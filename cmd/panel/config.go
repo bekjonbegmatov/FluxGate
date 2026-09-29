@@ -90,10 +90,7 @@ func (a *App) writeConfig() error {
 	if a.data != "/data" {
 		socketGroup = " group fluxgate"
 	}
-	publicLimit := a.maxConnections
-	if publicLimit == 0 {
-		publicLimit = 10000
-	}
+	publicLimit := a.connectionLimit()
 	reserve := max(8, min(256, publicLimit/10))
 	globalLimit := 2*publicLimit + reserve
 	if direct {
@@ -114,11 +111,11 @@ func (a *App) writeConfig() error {
 			fmt.Fprintf(&b, "  use_backend relay_%d if sni_%d\n", r.ID, r.ID)
 		}
 		fmt.Fprintln(&b, "  default_backend relay_fallback")
-		fmt.Fprintln(&b, "backend relay_fallback\n  mode tcp\n  server relay 127.0.0.1:9999")
+		fmt.Fprintf(&b, "backend relay_fallback\n  mode tcp\n  server relay %s\n", relaySocket(a.data, 0))
 		for _, r := range routes {
-			fmt.Fprintf(&b, "backend relay_%d\n  mode tcp\n  server relay 127.0.0.1:%d\n", r.ID, 10000+r.ID)
+			fmt.Fprintf(&b, "backend relay_%d\n  mode tcp\n  server relay %s\n", r.ID, relaySocket(a.data, r.ID))
 		}
-		fmt.Fprintf(&b, "frontend internal_tls\n  mode http\n  maxconn %d\n  timeout client 30s\n  bind 127.0.0.1:8443 ssl crt %s", publicLimit+reserve, filepath.Join(a.data, "certs", "fallback.pem"))
+		fmt.Fprintf(&b, "frontend internal_tls\n  mode http\n  maxconn %d\n  timeout client 30s\n  bind %s ssl crt %s", publicLimit+reserve, internalTLSBind(), filepath.Join(a.data, "certs", "fallback.pem"))
 	} else {
 		fmt.Fprintf(&b, "frontend public_direct\n  mode http\n  option contstats\n  maxconn %d\n  timeout client 30s\n  bind :443 ssl crt %s", publicLimit, filepath.Join(a.data, "certs", "fallback.pem"))
 	}

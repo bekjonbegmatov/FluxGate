@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 umask 077
+# Compose shell variables take precedence over --env-file. This setting is
+# deliberately managed in the file so rollback and subsequent starts agree.
+unset PANEL_MAX_CONNECTIONS
 source_dir=$(cd "$(dirname "$0")/.." && pwd)
 install_dir=${FLUXGATE_DIR:?Run update.sh}
 revision=${FLUXGATE_REVISION:?Run update.sh}
@@ -10,7 +13,7 @@ stamp=$(date -u +%Y%m%dT%H%M%SZ)-$$
 backup="$backup_root/$stamp"
 install -d -m 0700 "$backup"
 current=(docker compose -p "$project" --project-directory "$install_dir" --env-file "$install_dir/.env" -f "$install_dir/compose.yaml")
-candidate=(docker compose -p "$project" --project-directory "$source_dir" --env-file "$install_dir/.env" -f "$source_dir/compose.yaml")
+candidate=(docker compose -p "$project" --project-directory "$source_dir" --env-file "$backup/candidate.env" -f "$source_dir/compose.yaml")
 helper="$source_dir/deploy/update-helper.py"
 panel_id=$("${current[@]}" ps -q panel)
 haproxy_id=$("${current[@]}" ps -q haproxy)
@@ -34,6 +37,7 @@ done
 "${current[@]}" config --format json > "$backup/previous-compose.json"
 python3 "$helper" rollback-config "$backup/previous-compose.json" "$backup/rollback.compose.json" "$stamp"
 install -m 0600 "$install_dir/.env" "$backup/env"
+python3 "$helper" configure-env "$backup/env" "$backup/candidate.env" "${FLUXGATE_MAX_CONNECTIONS:-}"
 git -C "$install_dir" rev-parse HEAD > "$backup/previous-revision"
 printf '%s\n' "$revision" > "$backup/new-revision"
 echo 'Building new images while the existing installation serves traffic…'
@@ -42,9 +46,17 @@ echo 'Creating and validating a live backup…'
 docker inspect --format '{{json .Config.Env}}' "$panel_id" | python3 "$helper" backup "$backup/panel.zip"
 
 activated=0
+env_changed=0
 rollback() {
   status=$?
   trap - EXIT INT TERM
+  if [[ $env_changed == 1 ]]; then
+    if ! { install -m 0600 "$backup/env" "$install_dir/.env.fluxgate-update" && mv -f "$install_dir/.env.fluxgate-update" "$install_dir/.env"; }; then
+      # The resolved rollback Compose embeds the old environment, so still try
+      # to recover the services even if the checkout disk is now full/read-only.
+      echo "Could not restore .env. Restore it manually from $backup/env before the next update." >&2
+    fi
+  fi
   if [[ $activated == 1 ]]; then
     echo 'Update failed. Restoring the previous container images…' >&2
     if docker compose -p "$project" -f "$backup/rollback.compose.json" up -d --no-build --pull never --force-recreate; then
@@ -65,6 +77,9 @@ trap rollback EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 git -C "$install_dir" merge --ff-only "$revision"
+env_changed=1
+install -m 0600 "$backup/candidate.env" "$install_dir/.env.fluxgate-update"
+mv -f "$install_dir/.env.fluxgate-update" "$install_dir/.env"
 activated=1
 echo 'Switching containers. Existing connections will need to reconnect.'
 "${current[@]}" up -d --no-build --pull never --force-recreate --wait --wait-timeout 120

@@ -5,6 +5,7 @@ import http.cookiejar
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import ssl
 import sys
@@ -86,10 +87,30 @@ def rollback_config(source, destination, stamp):
     os.chmod(destination, 0o600)
 
 
+def configure_env(source, destination, value):
+    """Preserve secrets/comments verbatim; change only the explicit capacity key."""
+    content = Path(source).read_text()
+    if value:
+        if not re.fullmatch(r"[0-9]{1,6}", value) or not 1 <= int(value) <= 100000:
+            raise ValueError("Invalid connection limit")
+        lines = content.splitlines(keepends=True)
+        content = "".join(line for line in lines if not re.match(r"^\s*(?:export\s+)?PANEL_MAX_CONNECTIONS\s*=", line))
+        if content and not content.endswith("\n"):
+            content += "\n"
+        content += f"PANEL_MAX_CONNECTIONS={int(value)}\n"
+    with open(destination, "x") as output:
+        os.chmod(destination, 0o600)
+        output.write(content)
+        output.flush()
+        os.fsync(output.fileno())
+
+
 def main():
     os.umask(0o077)
     if sys.argv[1] == "rollback-config":
         rollback_config(*sys.argv[2:])
+    elif sys.argv[1] == "configure-env":
+        configure_env(*sys.argv[2:])
     else:
         env = dict(item.split("=", 1) for item in json.load(sys.stdin))
         if sys.argv[1] == "backup":

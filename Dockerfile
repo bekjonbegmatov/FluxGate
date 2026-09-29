@@ -1,4 +1,6 @@
 FROM golang:1.27-alpine AS go-build
+ARG GO_BUILD_PROCS=2
+ENV GOMAXPROCS=$GO_BUILD_PROCS GOFLAGS=-p=2
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download

@@ -1,6 +1,9 @@
 # Isolated, loopback-only integration stack. Never use the production volume.
 services:
   haproxy:
+    cpus: 1.0
+    sysctls:
+      net.ipv4.ip_local_port_range: "10000 65535"
     restart: unless-stopped
     image: fluxgate-test-haproxy
     build:
@@ -13,8 +16,9 @@ services:
     volumes:
       - test-data:/data
     ulimits:
-      nofile: 262144
+      nofile: 1048576
   panel:
+    cpus: 1.0
     restart: unless-stopped
     image: fluxgate-test-panel
     build: ..
@@ -30,6 +34,7 @@ services:
       PANEL_TOKEN: integration-only-token-not-a-real-secret
       PANEL_MASTER_KEY: integration-only-key-not-a-real-secret
       PANEL_FLUSH_INTERVAL: 5s
+      PANEL_MAX_CONNECTIONS: 100000
     volumes:
       - test-data:/data
     stop_grace_period: 45s
@@ -39,8 +44,9 @@ services:
       timeout: 5s
       retries: 20
     ulimits:
-      nofile: 262144
+      nofile: 1048576
   origin:
+    cpus: 0.5
     image: node:22-alpine
     init: true
     command: ["node", "/test/origin.mjs"]

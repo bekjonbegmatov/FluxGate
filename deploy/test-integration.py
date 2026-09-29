@@ -139,20 +139,23 @@ def check_direct_limits(ids):
         compose('exec','-T','panel','kill','-CONT',pid)
         tunnel.close()
     wait_for(lambda:download('route0.example.test')[0]==200)
-    tunnel=open_tunnel('route0.example.test')
+    watchdog_tunnels=[open_tunnel('route0.example.test') for _ in range(3)]
     # Keep a quota-bearing stream on a draining generation: the watchdog must
     # close it even though ordinary server commands reject stopped backends.
     update(ids[1],sni='watchdog-reload.example.test')
     wait_for(lambda:download('watchdog-reload.example.test')[0]==200)
-    echo_bytes(tunnel,1024)
+    for tunnel in watchdog_tunnels:
+        echo_bytes(tunnel,1024)
     compose('pause','panel')
     try:
         wait_for(lambda:download('route0.example.test')[0]==503,25)
         assert download('watchdog-reload.example.test')[0]==200
-        assert_tunnel_closed(tunnel)
+        for tunnel in watchdog_tunnels:
+            assert_tunnel_closed(tunnel)
     finally:
         compose('unpause','panel')
-        tunnel.close()
+        for tunnel in watchdog_tunnels:
+            tunnel.close()
     wait_for(lambda:download('route0.example.test')[0]==200)
     update(ids[0],daily_limit=0)
     update(ids[2],monthly_limit=0)
@@ -181,7 +184,7 @@ def echo_bytes(tunnel,size):
         assert received==chunk
         remaining-=len(chunk)
 
-def check_direct(ids):
+def check_direct(ids, load=True):
     set_mode('direct')
     wait_for(lambda:'frontend public_direct' in compose('exec','-T','panel','cat','/data/haproxy.cfg'))
     # Existing exhausted quotas / 1 byte/s limits must not affect direct mode.
@@ -196,6 +199,7 @@ def check_direct(ids):
     assert download('route0.example.test',2*1024*1024)[0]==200
     wait_for(lambda:route(ids[0])['down_total']>=before+2*1024*1024)
     tunnel=open_tunnel('route0.example.test')
+    additional_tunnels=[open_tunnel('route0.example.test') for _ in range(2)]
     # Reloads must retain BOTH new and draining-worker counters.
     before=route(ids[0])['down_total']
     for i in range(3):
@@ -216,12 +220,17 @@ def check_direct(ids):
     compose('restart','-t','45','panel')
     wait_for(lambda:api('/settings')['proxy_mode']=='direct')
     echo_bytes(tunnel,1024*1024)
+    for extra in additional_tunnels:
+        echo_bytes(extra,1024)
     wait_for(lambda:route(ids[0])['down_total']>=before+1024*1024)
     assert route(ids[0])['down_total']<before+2*1024*1024,'counter doubled after panel restart'
     update(ids[0],paused=True)
     wait_for(lambda:download('route0.example.test')[0]==503)
     assert_tunnel_closed(tunnel)
     tunnel.close()
+    for extra in additional_tunnels:
+        assert_tunnel_closed(extra)
+        extra.close()
     update(ids[0],paused=False)
     wait_for(lambda:download('route0.example.test')[0]==200)
     print('PASS: panel restart recovers old-worker traffic; direct pause/resume works',flush=True)
@@ -242,7 +251,8 @@ def check_direct(ids):
     assert route(ids[0])['down_total']>=before
     print('PASS: confirmed full restart brings panel and HAProxy back with mode/counters intact',flush=True)
 
-    subprocess.run(COMPOSE+['exec','-T','origin','node','/test/load.mjs','20','4'],check=True)
+    if load:
+        subprocess.run(COMPOSE+['exec','-T','origin','node','/test/load.mjs','20','4'],check=True)
     assert api('/system')['relay_connections']==0
     check_direct_limits(ids)
     update(ids[2],daily_limit=1)
@@ -259,10 +269,19 @@ def check_direct(ids):
     print('PASS: returning to relay closes direct tunnels and enforces saved quotas',flush=True)
 
 def main(seconds, history_days):
-    compose("build")
+    # Keep laptop builds bounded and sequential; throughput tests are opt-in
+    # when --functional-only is selected.
+    compose("build", "--build-arg", "GO_BUILD_PROCS=1", "panel")
+    compose("build", "--build-arg", "GO_BUILD_PROCS=1", "haproxy")
     try:
         compose("up","-d","--wait","--wait-timeout","120")
         api("/login","POST",{"token":TOKEN})
+        assert api('/system')['max_client_connections']==100000
+        for mode, limit in [('relay',200256),('direct',100256),('relay',200256)]:
+            set_mode(mode)
+            wait_for(lambda:download('fallback.example.test')[0]==200)
+            wait_for(lambda:f'Maxconn: {limit}' in master_command('@1 show info'))
+        print('PASS: real HAProxy starts with 100k public cap in both modes (not a 100k load test)',flush=True)
         assert download("fallback.example.test")[0]==200
         origin=compose("ps","-q","origin")
         ip=subprocess.check_output(["docker","inspect","--format","{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",origin],text=True).strip()
@@ -303,10 +322,7 @@ def main(seconds, history_days):
         print("PASS: upgraded tunnel survives four actual HAProxy reloads",flush=True)
         update(ids[0],paused=True)
         assert download("route0.example.test")[0]==503
-        try:
-            assert tunnel.recv(1)==b""
-        except (OSError,ssl.SSLError):
-            pass
+        assert_tunnel_closed(tunnel)
         tunnel.close()
         update(ids[0],paused=False)
         assert download("route0.example.test")[0]==200
@@ -378,7 +394,12 @@ def main(seconds, history_days):
         subprocess.run(COMPOSE+["exec","-T","origin","node","/test/capacity.mjs"],check=True)
         wait_for(lambda:download("route0.example.test")[0]==200)
 
-        check_direct(ids)
+        check_direct(ids, load=seconds>0)
+
+        if seconds == 0:
+            wait_for(lambda:api('/system')['relay_connections']==0,40)
+            print('PASS: functional-only run complete; sustained load/history generation skipped',flush=True)
+            return
 
         if history_days:
             subprocess.run(COMPOSE+["exec","-T","origin","node","--experimental-sqlite","/test/seed-history.mjs",str(history_days)],check=True)
@@ -421,5 +442,6 @@ if __name__=="__main__":
     parser=argparse.ArgumentParser()
     parser.add_argument("--seconds",type=int,default=30)
     parser.add_argument("--history-days",type=int,default=0)
+    parser.add_argument("--functional-only",action="store_true",help="Skip throughput load and history generation; only small protocol/lifecycle tests")
     args=parser.parse_args()
-    main(args.seconds,args.history_days)
+    main(0 if args.functional_only else args.seconds,0 if args.functional_only else args.history_days)

@@ -13,7 +13,7 @@ RuntimeDirectory=fluxgate
 ExecStart=/usr/local/libexec/fluxgate-watch
 Restart=always
 RestartSec=2
-LimitNOFILE=262144
+LimitNOFILE=1048576
 TimeoutStopSec=30
 
 [Install]

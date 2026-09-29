@@ -23,6 +23,33 @@ class FakeOpener:
 
 
 class HelperTests(unittest.TestCase):
+    def test_entry_rejects_invalid_capacity_before_any_install_action(self):
+        for args in [['--max-connections','0'],['--max-connections','100001'],['--max-connections','oops'],['--max-connections'],['--unknown']]:
+            result=subprocess.run(['bash',str(HERE.parent/'update.sh')]+args,text=True,capture_output=True,timeout=5)
+            self.assertNotEqual(result.returncode,0)
+            self.assertTrue('Usage:' in result.stderr or 'Connection limit' in result.stderr,result.stderr)
+
+    def test_capacity_changes_only_requested_key(self):
+        original = '# keep comments\nPANEL_TOKEN="test-only=$value"\nexport PANEL_MAX_CONNECTIONS=20000\nPANEL_DOMAIN=test.example\nPANEL_MAX_CONNECTIONS=10000\n'
+        with tempfile.TemporaryDirectory() as directory:
+            source,target=Path(directory)/'env',Path(directory)/'candidate'
+            source.write_text(original)
+            helper.configure_env(source,target,'100000')
+            self.assertEqual(source.read_text(),original)
+            self.assertEqual(target.read_text(),'# keep comments\nPANEL_TOKEN="test-only=$value"\nPANEL_DOMAIN=test.example\nPANEL_MAX_CONNECTIONS=100000\n')
+            self.assertEqual(target.stat().st_mode&0o777,0o600)
+            self.assertRaises(FileExistsError,helper.configure_env,source,target,'50000')
+
+    def test_capacity_invalid_or_omitted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source,target=Path(directory)/'env',Path(directory)/'candidate'
+            source.write_text('PANEL_MAX_CONNECTIONS=20000\n')
+            for value in ['0','100001','-1','1; echo test','oops']:
+                self.assertRaises(ValueError,helper.configure_env,source,target,value)
+                self.assertFalse(target.exists())
+            helper.configure_env(source,target,'')
+            self.assertEqual(target.read_bytes(),source.read_bytes())
+
     def test_backup_validates_and_secures_archive(self):
         content=io.BytesIO()
         with zipfile.ZipFile(content,"w") as archive:
@@ -85,6 +112,10 @@ from pathlib import Path
 if sys.argv[1] in ('backup','verify'):json.load(sys.stdin)
 with open(os.environ['EVENT_LOG'],'a') as f:f.write(json.dumps(['helper']+sys.argv[1:])+'\\n')
 if sys.argv[1]=='rollback-config':Path(sys.argv[3]).write_text('{}')
+elif sys.argv[1]=='configure-env':
+ content=Path(sys.argv[2]).read_text()
+ if sys.argv[4]:content+='PANEL_MAX_CONNECTIONS='+sys.argv[4]+'\\n'
+ Path(sys.argv[3]).write_text(content)
 elif sys.argv[1]=='backup':
  if os.environ['TEST_CASE']=='backup-failure':sys.exit(19)
  Path(sys.argv[2]).write_bytes(b'validated-in-helper-tests')
@@ -105,9 +136,13 @@ class UpdateFlowTests(unittest.TestCase):
                 path.write_text(MOCK_COMMAND)
                 path.chmod(0o700)
             log=root/"events.jsonl"
-            env=dict(os.environ,PATH=str(commands)+os.pathsep+os.environ["PATH"],EVENT_LOG=str(log),TEST_CASE=case,FLUXGATE_DIR=str(checkout),FLUXGATE_REVISION="new-revision",FLUXGATE_BACKUP_DIR=str(root/"backups"))
+            env=dict(os.environ,PATH=str(commands)+os.pathsep+os.environ["PATH"],EVENT_LOG=str(log),TEST_CASE=case,FLUXGATE_DIR=str(checkout),FLUXGATE_REVISION="new-revision",FLUXGATE_BACKUP_DIR=str(root/"backups"),FLUXGATE_MAX_CONNECTIONS='100000')
             result=subprocess.run(["bash",str(stage/"deploy/update-docker.sh")],env=env,text=True,capture_output=True,timeout=15)
             events=[json.loads(line) for line in log.read_text().splitlines()]
+            expected='PANEL_TOKEN=test-only\n'+('PANEL_MAX_CONNECTIONS=100000\n' if case=='success' else '')
+            self.assertEqual((checkout/'.env').read_text(),expected,'capacity update/rollback lost original env')
+            for saved in (root/'backups').glob('*/env'):
+                self.assertEqual(saved.read_text(),'PANEL_TOKEN=test-only\n')
             return result,events
 
     def test_custom_compose_is_rejected_before_build_or_restart(self):

@@ -2,10 +2,12 @@ package main
 
 import (
 	"bufio"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/metrics"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,6 +22,40 @@ var cpuSample struct {
 	sync.Mutex
 	previous cpuCounters
 	usage    cpuUsageStats
+}
+
+// Reading/sorting 200k FD entries on every dashboard poll itself becomes work.
+// Count in bounded pages and cache separately; it is diagnostic, not admission.
+var descriptorSample struct {
+	sync.Mutex
+	count int
+	at    time.Time
+}
+
+func processFDCount() (int, time.Time) {
+	descriptorSample.Lock()
+	defer descriptorSample.Unlock()
+	if time.Since(descriptorSample.at) < 30*time.Second {
+		return descriptorSample.count, descriptorSample.at
+	}
+	f, err := os.Open("/proc/self/fd")
+	if err != nil {
+		return 0, time.Time{}
+	}
+	defer f.Close()
+	count := 0
+	for {
+		names, err := f.Readdirnames(1024)
+		count += len(names)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return 0, time.Time{}
+		}
+	}
+	descriptorSample.count, descriptorSample.at = count, time.Now()
+	return count, descriptorSample.at
 }
 
 func parseCPUCounters(data []byte) (cpuCounters, bool) {
@@ -139,9 +175,9 @@ func (a *App) systemAPI(w http.ResponseWriter, r *http.Request) {
 	stats["direct_stats_errors"] = a.directErrors.Load()
 	stats["uptime_seconds"] = int64(time.Since(a.start).Seconds())
 	stats["goroutines"] = runtime.NumGoroutine()
-	var memory runtime.MemStats
-	runtime.ReadMemStats(&memory)
-	stats["heap_bytes"] = memory.HeapAlloc
+	heap := []metrics.Sample{{Name: "/memory/classes/heap/objects:bytes"}}
+	metrics.Read(heap) // avoid ReadMemStats' global pause on every dashboard poll
+	stats["heap_bytes"] = heap[0].Value.Uint64()
 	active, paused, quota := 0, 0, 0
 	quotasEnabled := a.quotasEnabled()
 	var pending int64
@@ -158,6 +194,8 @@ func (a *App) systemAPI(w http.ResponseWriter, r *http.Request) {
 		s.mu.Unlock()
 	}
 	stats["relay_connections"] = active
+	stats["relay_admitted_connections"] = a.relayAdmitted.Load()
+	stats["relay_capacity_rejections"] = a.relayRejected.Load()
 	stats["relay_buffer_bytes"] = active * 2 * relayBufferSize
 	stats["paused_routes"], stats["quota_routes"] = paused, quota
 	stats["traffic_unsaved_bytes"] = pending
@@ -167,8 +205,15 @@ func (a *App) systemAPI(w http.ResponseWriter, r *http.Request) {
 	stats["max_client_connections"] = a.maxConnections
 	stats["public_connections"] = a.publicConnections.Load()
 	stats["public_peak_connections"] = a.publicPeak.Load()
-	if fds, err := os.ReadDir("/proc/self/fd"); err == nil {
-		stats["agent_open_fds"] = len(fds)
+	if count, at := processFDCount(); !at.IsZero() {
+		stats["agent_open_fds"], stats["agent_fds_sampled_at"] = count, at.Unix()
+	}
+	var limits syscall.Rlimit
+	if syscall.Getrlimit(syscall.RLIMIT_NOFILE, &limits) == nil {
+		stats["agent_nofile_soft"], stats["agent_nofile_hard"] = limits.Cur, limits.Max
+	}
+	if raw, err := os.ReadFile("/proc/sys/net/ipv4/ip_local_port_range"); err == nil {
+		stats["ephemeral_port_range"] = strings.TrimSpace(string(raw))
 	}
 	for _, name := range []string{"panel.db", "panel.db-wal", "panel.db-shm"} {
 		if f, err := os.Stat(filepath.Join(a.data, name)); err == nil {

@@ -51,6 +51,8 @@
 
 Не удерживайте SQL rows или stateMu во время отправки выгрузки клиенту. У запросов истории должен сохраняться контекст отмены и ограниченный кэш. Любое изменение HAProxy maxconn должно учитывать ДВА frontend на клиента; проверьте `deploy/test-capacity.mjs` через integration script. Накопленная история проверяется с `--history-days 90`; подробно см. `docs/PERFORMANCE.md`. Диагностика не должна включать env, cookie, токены, домены или содержимое сертификатов.
 
+Потолок PANEL_MAX_CONNECTIONS — 100000, default 10000. HAProxy→Go идёт через Unix sockets, Go→HAProxy через 16 loopback TCP-входов 8443–8458 с least-active распределением. Нельзя заменять внутренний TCP на Unix без regression-теста закрытия TLS/WS: Unix EOF оставлял orphan streams. Проверяйте общий admission cap Go, FD лимиты и исходящие TCP pools; 100k в конфиге не доказывает ёмкость VPS. На рабочем компьютере используйте `GOMAXPROCS=2 go test -race -p 1 ./...` и `python3 deploy/test-integration.py --functional-only`, без тяжёлой нагрузки. Полный throughput/100k concurrency тест требует отдельного согласованного стенда. При изменении updater с `--max-connections` проверяйте rollback .env, а не только образов.
+
 ## Нетривиальные детали
 
 - `PANEL_SECRET_PATH` на уровне Go настраивается, но собранный Vite использует статическую базу `/admin/`. Установщик фиксирует `admin`. Изменение пути требует также изменения `web/vite.config.ts` и новой сборки.

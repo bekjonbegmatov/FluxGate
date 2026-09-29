@@ -120,6 +120,9 @@ type App struct {
 	start                         time.Time
 	flushInterval                 time.Duration
 	maxConnections                int
+	relayAdmitted                 atomic.Int64
+	relayRejected                 atomic.Uint64
+	relayIngress                  internalTLSIngress
 	proxyMode                     string // protected by mu; empty means relay (old installs)
 	directLimits                  bool   // explicit opt-in, protected by mu
 	direct                        directMeter
@@ -190,7 +193,8 @@ func main() {
 		log.Fatal("supported options: --healthcheck, --diagnose, --web, --agent")
 	}
 	log.SetPrefix("agent: ")
-	data := env("PANEL_DATA", "./data")
+	data, err := filepath.Abs(env("PANEL_DATA", "./data"))
+	fatal(err)
 	fatal(os.MkdirAll(data, 0700))
 	lock, err := lockAgent(data)
 	fatal(err)
@@ -234,11 +238,8 @@ func main() {
 	if a.flushInterval < time.Second || a.flushInterval > time.Minute {
 		log.Fatal("PANEL_FLUSH_INTERVAL must be between 1s and 1m")
 	}
-	a.maxConnections, err = strconv.Atoi(env("PANEL_MAX_CONNECTIONS", "10000"))
+	a.maxConnections, err = parseMaxConnections(env("PANEL_MAX_CONNECTIONS", strconv.Itoa(defaultMaxConnections)))
 	fatal(err)
-	if a.maxConnections < 1 || a.maxConnections > 20000 {
-		log.Fatal("PANEL_MAX_CONNECTIONS must be between 1 and 20000")
-	}
 	if !validDomain(a.domain) {
 		log.Fatal("invalid PANEL_DOMAIN")
 	}

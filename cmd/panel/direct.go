@@ -130,11 +130,14 @@ func (w *meterWorker) command(command string) ([]byte, error) {
 	}
 	var out bytes.Buffer
 	for out.Len() < maxRuntimeResponse {
-		b, err := w.reader.ReadByte()
-		if err != nil {
+		chunk, err := w.reader.ReadSlice(' ')
+		if err != nil && err != bufio.ErrBufferFull {
 			return nil, err
 		}
-		out.WriteByte(b)
+		if out.Len()+len(chunk) > maxRuntimeResponse {
+			return nil, fmt.Errorf("HAProxy runtime response exceeds limit")
+		}
+		out.Write(chunk)
 		if bytes.HasSuffix(out.Bytes(), []byte("\n> ")) {
 			return bytes.TrimSuffix(out.Bytes(), []byte("\n> ")), nil
 		}
@@ -477,7 +480,7 @@ func (a *App) recoverDirectWorkers(now time.Time, report func(error)) {
 		for backend := range observed {
 			blocked := !allowed[backend] || a.restartRequested.Load() || shaped[backend] || (limited[backend] && !a.persistenceFresh(time.Now()))
 			if blocked {
-				command := func(s string) ([]byte, error) { return haproxyCommand(path, prefix+s) }
+				command := func(s string) ([]byte, error) { return haproxyCommand(path, workerCommands(prefix, s)) }
 				if err := enforceDirectBackend(command, backend, blocked); err != nil {
 					report(err)
 				}
