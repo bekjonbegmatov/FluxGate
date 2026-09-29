@@ -82,6 +82,7 @@ elif 'up' in args and '--wait' in args and case=='activation-failure':sys.exit(1
 '''
 MOCK_HELPER='''import json,os,sys
 from pathlib import Path
+if sys.argv[1] in ('backup','verify'):json.load(sys.stdin)
 with open(os.environ['EVENT_LOG'],'a') as f:f.write(json.dumps(['helper']+sys.argv[1:])+'\\n')
 if sys.argv[1]=='rollback-config':Path(sys.argv[3]).write_text('{}')
 elif sys.argv[1]=='backup':

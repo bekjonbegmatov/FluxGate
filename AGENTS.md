@@ -22,6 +22,7 @@
 | `cmd/panel/relay.go` | Relay, квоты в памяти, скорость, здоровье, lifecycle соединений |
 | `cmd/panel/accounting.go` | Пакетное сохранение без удержания relay mutex, смена периодов |
 | `cmd/panel/health.go` | Готовность SQLite/HAProxy, CLI healthcheck |
+| `cmd/panel/history.go`, `cmd/panel/diagnostics.go` | Ограниченный кэш графиков, разовые несекретные метрики |
 | `cmd/panel/requeststats.go` | HAProxy stats socket, счётчики HTTP и история |
 | `cmd/panel/finance.go` | Аренда, платежи, напоминания |
 | `cmd/panel/export.go` | Авторизованные CSV оплаты и трафика |
@@ -45,6 +46,8 @@
 7. Делайте небольшие осмысленные коммиты. Обновляйте README и документацию при изменении функций или ограничений.
 
 Для изменений relay/accounting выполняйте также `go test -race ./...`. Не удерживайте `RouteState.mu` во время SQL, сетевых операций или ожидания limiter. `stateMu` сериализует изменения маршрутов и persistence; после DB commit вычитайте только сохранённые дельты. Метаданные маршрута нельзя откатывать вместе с накопленными за время запроса байтами. Новые изменения updater проверяйте `python3 deploy/test-update.py`. Полный TLS/reload/quota/restart-тест — `python3 deploy/test-integration.py --seconds 60` в отдельном локальном Docker-проекте.
+
+Не удерживайте SQL rows или stateMu во время отправки выгрузки клиенту. У запросов истории должен сохраняться контекст отмены и ограниченный кэш. Любое изменение HAProxy maxconn должно учитывать ДВА frontend на клиента; проверьте `deploy/test-capacity.mjs` через integration script. Накопленная история проверяется с `--history-days 90`; подробно см. `docs/PERFORMANCE.md`. Диагностика не должна включать env, cookie, токены, домены или содержимое сертификатов.
 
 ## Нетривиальные детали
 

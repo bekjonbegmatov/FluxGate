@@ -18,6 +18,7 @@ import ssl
 import subprocess
 import time
 import tempfile
+import threading
 import urllib.request
 import zipfile
 
@@ -81,7 +82,7 @@ def update(rid,**changes):
     r.update(changes)
     return api(f"/routes/{rid}","PUT",r)
 
-def main(seconds):
+def main(seconds, history_days):
     compose("build")
     try:
         compose("up","-d","--wait","--wait-timeout","120")
@@ -175,10 +176,38 @@ def main(seconds):
                 assert 'panel.db' in saved.namelist() and saved.testzip() is None
         print("PASS: updater creates a validated live backup using existing credentials",flush=True)
 
+        subprocess.run(COMPOSE+["exec","-T","origin","node","/test/capacity.mjs"],check=True)
+        wait_for(lambda:download("route0.example.test")[0]==200)
+
+        if history_days:
+            subprocess.run(COMPOSE+["exec","-T","origin","node","--experimental-sqlite","/test/seed-history.mjs",str(history_days)],check=True)
+        poll_stop=threading.Event()
+        poll_errors=[]
+        latencies=[]
+        def poll_history():
+            while not poll_stop.is_set():
+                start=time.monotonic()
+                try:
+                    assert api('/history/all?hours=2160')
+                    assert api('/request-history/all?hours=2160')
+                    stats=api('/system')
+                    assert stats.get('traffic_flush_errors',0)==0,stats
+                except Exception as error:
+                    poll_errors.append(type(error).__name__)
+                latencies.append(round(time.monotonic()-start,3))
+                poll_stop.wait(5)
+        poller=threading.Thread(target=poll_history,daemon=True)
+        poller.start()
         process=subprocess.Popen(COMPOSE+["exec","-T","origin","node","/test/load.mjs",str(seconds),"4"],stdout=subprocess.PIPE,text=True)
-        for line in process.stdout:
-            print(line.rstrip(),flush=True)
-        assert process.wait()==0,"Linux TLS load test failed"
+        try:
+            for line in process.stdout:
+                print(line.rstrip(),flush=True)
+            assert process.wait()==0,"Linux TLS load test failed"
+        finally:
+            poll_stop.set()
+            poller.join(timeout=45)
+        assert not poller.is_alive() and not poll_errors,("history polling",poll_errors)
+        print(json.dumps({"history_poll_seconds":latencies}),flush=True)
         wait_for(lambda:api("/system")["relay_connections"]==0)
         print("PASS: sustained traffic, no remaining route connections",flush=True)
         stats=api('/system')
@@ -190,4 +219,6 @@ def main(seconds):
 if __name__=="__main__":
     parser=argparse.ArgumentParser()
     parser.add_argument("--seconds",type=int,default=30)
-    main(parser.parse_args().seconds)
+    parser.add_argument("--history-days",type=int,default=0)
+    args=parser.parse_args()
+    main(args.seconds,args.history_days)

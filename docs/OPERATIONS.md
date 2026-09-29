@@ -19,6 +19,7 @@
 | `PANEL_DOMAIN` | Начальный fallback домен, затем значение из SQLite |
 | `PANEL_TIMEZONE` | Часовой пояс квот и аренды, после restore значение из SQLite |
 | `PANEL_FLUSH_INTERVAL` | Интервал пакетного сохранения трафика: `5s`, допустимо `1s`–`1m` |
+| `PANEL_MAX_CONNECTIONS` | Максимум внешних клиентов одновременно: `10000`, диапазон `1`–`20000`; внутренние HAProxy slots резервируются отдельно |
 | `PANEL_TOKEN` | Токен входа, минимум 24 символа |
 | `PANEL_MASTER_KEY` | Шифрование Telegram token и подпись сессий, минимум 24 символа |
 
@@ -55,6 +56,12 @@ curl -fsSL https://raw.githubusercontent.com/bekjonbegmatov/FluxGate/main/update
 `curl -fsS http://127.0.0.1:9389/healthz` проверяет SQLite и локальные listeners/сокет HAProxy. В Docker: `docker compose -p fluxgate exec -T panel /usr/local/bin/panel --healthcheck`. При статусе unhealthy сначала смотрите журналы: Docker сам по себе не перезапускает контейнер исключительно по unhealthy; перезапуск настроен на выход процесса. Watcher завершается при падении master, поэтому его автоматически перезапускает Docker/systemd. Оба образа явно используют `STOPSIGNAL SIGTERM`, чтобы панель сохраняла данные при остановке.
 
 Авторизованный `/admin/api/system` показывает `goroutines`, `heap_bytes`, `relay_connections`, `db_wait_count`, `db_wait_seconds`. Сравнивайте их во время нагрузки и после её окончания. `PANEL_FLUSH_INTERVAL` меняет частоту записи, но не точность оперативной квоты или частоту расчёта скорости. На диске остаются только успешно сохранённые данные; продолжительный отказ хранилища увеличивает возможные потери при аварии процесса.
+
+Дополнительно доступны размеры `panel.db`/WAL/SHM, `traffic_unsaved_bytes`, время/ошибки последнего сохранения, `VmRSS_bytes`, `VmSwap_bytes`, число paused/quota-маршрутов и память relay-буферов. Для краткого снимка после обновления: `docker compose -p fluxgate exec -T panel /usr/local/bin/panel --diagnose`. Снимок включает HAProxy `CurrConns`/`Maxconn` и `scur`/`slim` обоих frontend, но не выдаёт токены или список доменов. Разовый `deploy/diagnose.py` из README работает также со старой версией; собирает host vmstat/ss, Docker CPU/RAM/OOM/restart, размеры БД и Runtime API через локальный volume. Требуются Python 3 и доступ к Docker. Он не перезапускает службы и не сканирует таблицы SQLite.
+
+Собирайте диагностику **во время замедления, до рестарта**. Низкий общий CPU не исключает заполнение лимита соединений, swap, iowait/steal или исчерпание ephemeral ports. Рост счётчика байтов до нескольких ТБ сам по себе не увеличивает число строк: история содержит одну строку на активный маршрут и минуту. Для 20 маршрутов за 90 дней это до 2 592 000 строк в каждой таблице истории. Причины и тесты разобраны в [PERFORMANCE.md](PERFORMANCE.md).
+
+Полная проверка с синтетической накопленной историей: `python3 deploy/test-integration.py --seconds 300 --history-days 90`. Она дополнительно воспроизводит насыщение двух frontend при малом лимите, проверяет закрытие молчащих клиентов и опрашивает графики параллельно TLS-нагрузке. Запускайте только на тестовой машине. Холодный большой график всё ещё требует сканирования выбранного диапазона, кэш ускоряет повторные запросы; это не переход на другую СУБД.
 
 Разработка: `go test ./...`, `go vet ./...`, `npm --prefix web ci`, `npm --prefix web run build`, `bash -n install.sh`. Панель должна отвечать 200 на `/admin/`, а без cookie — 401 на `/admin/api/backup`. С cookie проверьте `/admin/api/routes`, `/admin/api/request-stats`, `/admin/api/backup`. Публичный proxy: `curl -sk --resolve cubeland.top:443:127.0.0.1 https://cubeland.top/`. Проверка `ss -lntp` должна показывать 443 и 9389 на публичных интерфейсах. У облачного провайдера может быть отдельный firewall; разрешите TCP 443/9389 там.
 

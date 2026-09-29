@@ -43,6 +43,8 @@ services:
     volumes:
       - ./test-origin.mjs:/test/origin.mjs:ro
       - ./test-load.mjs:/test/load.mjs:ro
-      - test-data:/data:ro
+      - ./test-capacity.mjs:/test/capacity.mjs:ro
+      - ./test-seed-history.mjs:/test/seed-history.mjs:ro
+      - test-data:/data
 volumes:
   test-data:
