@@ -27,7 +27,7 @@ func (a *App) healthAPI(w http.ResponseWriter, r *http.Request) {
 	}
 	// Check both services, not only that the SPA is being served from disk.
 	addresses := []struct{ network, address string }{{"unix", filepath.Join(a.data, "haproxy.sock")}, {"tcp", "127.0.0.1:443"}, {"tcp", "127.0.0.1:8181"}}
-	if !a.directMode() {
+	if a.needsInternalTLS() {
 		for port := internalTLSFirstPort; port < internalTLSFirstPort+internalTLSShards; port++ {
 			addresses = append(addresses, struct{ network, address string }{"tcp", fmt.Sprintf("127.0.0.1:%d", port)})
 		}

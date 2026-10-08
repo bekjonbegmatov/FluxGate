@@ -6,7 +6,8 @@
 
 - Публичный трафик входит через HAProxy на 443. Админка доступна по **HTTP** на 9389, путь `/admin/`. Текущая установка слушает все интерфейсы. Не меняйте этот пользовательский выбор самовольно.
 - Главный домен — fallback. Он редактируется в настройках и хранится в SQLite как `settings.domain`; значение из `PANEL_DOMAIN` используется при первом старте. Нельзя назначить основной домен серверному маршруту.
-- В режиме `relay` SNI маршрутизирует TLS до расшифровки; HTTP/WS проходят через внутренний TLS frontend. Лимиты и квоты реализует Go, обход запрещён. Явно выбранный глобальный `settings.proxy_mode=direct` — согласованное исключение: единственный TLS frontend HAProxy ведёт к upstream, без opt-in direct_limits квоты/rate limiting отключены; с ним квоты мягкие, скорость ограничивает HAProxy. UI обязан показывать различие со строгим relay. Старые установки по умолчанию остаются relay.
+- В режиме `relay` SNI маршрутизирует TLS до расшифровки; HTTP/WS проходят через внутренний TLS frontend. Лимиты и квоты реализует Go, обход запрещён. Явно выбранный глобальный `settings.proxy_mode=direct` — согласованное исключение: HAProxy ведёт к upstream без Go (обычно один TLS frontend; при passthrough есть TCP SNI dispatcher), без opt-in direct_limits квоты/rate limiting отключены; с ним квоты мягкие, скорость ограничивает HAProxy. UI обязан показывать различие со строгим relay. Старые установки по умолчанию остаются relay.
+- `routes.tls_passthrough` — opt-in на маршрут, default false. Relay передаёт сырой TLS через Go прямо к upstream со строгими квотами; direct — TCP backend HAProxy. При mixed direct обычные маршруты/fallback идут через 16 TCP-входов internal_tls и требуют global maxconn 2N+reserve. Никаких TLS handshake/HTTP-ошибок от FluxGate для passthrough; блокировка закрывает TCP. Счётчики TCP backend — TLS-байты, HTTP-метрики недоступны. Основной домен и точные SNI имеют приоритет над wildcard.
 - Самоподписанные сертификаты создаёт Go и хранит в `PANEL_DATA/certs`. Их предупреждение в браузере ожидаемо до установки доверия.
 - Финансы — журнал **полученных оплат** и дата «оплачено до». Здесь нет долга или автоматического начисления. Telegram напоминает о продлении в указанную дату после 09:00 по часовому поясу панели.
 - Backup ZIP содержит SQLite, сертификаты и Telegram bot token в manifest.json. Он содержит чувствительные данные. Восстановление сохраняет токен входа текущей установки, шифрует Telegram token её мастер-ключом и перезапускает сервис.
@@ -20,6 +21,7 @@
 | `cmd/panel/direct_limits.go`, `probe.go` | Мягкие direct-квоты/watchdog и end-to-end HTTPS/incident capture |
 | `cmd/panel/api.go` | Авторизованный API, CRUD маршрутов, настройки, история |
 | `cmd/panel/config.go` | Генерация и проверка HAProxy config |
+| `cmd/panel/passthrough.go` | Миграция TLS passthrough, сертификаты и readiness смешанного режима |
 | `cmd/panel/relay.go` | Relay, квоты в памяти, скорость, здоровье, lifecycle соединений |
 | `cmd/panel/accounting.go` | Пакетное сохранение без удержания relay mutex, смена периодов |
 | `cmd/panel/direct.go`, `settings.go`, `restart.go` | Direct byte accounting/checkpoints, глобальный режим и перезапуск обеих служб |

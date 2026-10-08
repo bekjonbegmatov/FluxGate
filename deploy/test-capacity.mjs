@@ -6,6 +6,7 @@ import tls from 'node:tls';
 import assert from 'node:assert/strict';
 import {setTimeout as delay} from 'node:timers/promises';
 const config='/data/haproxy.cfg', original=fs.readFileSync(config,'utf8');
+const outer=original.includes('frontend public_sni\n')?'public_sni':'public_direct';
 function apply(value){fs.writeFileSync(config+'.capacity-test',value,{mode:0o600});fs.renameSync(config+'.capacity-test',config)}
 function stats(){return new Promise((resolve,reject)=>{
   const c=net.createConnection('/data/haproxy.sock',()=>c.write('show stat\n'));let body='';
@@ -15,11 +16,18 @@ function stats(){return new Promise((resolve,reject)=>{
     resolve(Object.fromEntries(lines.filter(x=>x[1]==='FRONTEND').map(x=>[x[0],Object.fromEntries(names.map((k,i)=>[k,x[i]]))])));
   });c.on('error',reject);c.setTimeout(2000,()=>c.destroy(new Error('stats timeout')));
 })}
+async function waitLimit(limit){
+  for(let i=0;i<100;i++){
+    try{if(Number((await stats())[outer]?.slim)===limit)return}catch{}
+    await delay(200);
+  }
+  throw new Error(`HAProxy did not apply ${outer} limit ${limit}`);
+}
 async function scenario(legacy){
   let value=original.replace(/^  maxconn \d+\n/gm,'');
   value=value.replace('global\n',`global\n  maxconn ${legacy?32:40}\n`);
-  if(!legacy)value=value.replace('frontend public_sni\n','frontend public_sni\n  maxconn 16\n').replace('frontend internal_tls\n','frontend internal_tls\n  maxconn 24\n');
-  apply(value);await delay(2200);
+  if(!legacy)value=value.replace(`frontend ${outer}\n`,`frontend ${outer}\n  maxconn 16\n`).replace('frontend internal_tls\n','frontend internal_tls\n  maxconn 24\n');
+  apply(value);await waitLimit(legacy?32:16);
   const sockets=[],secured=[];
   try{
     await Promise.all(Array.from({length:24},()=>new Promise((resolve,reject)=>{
@@ -27,7 +35,7 @@ async function scenario(legacy){
     })));
     // Establish every outer connection BEFORE allowing inner TLS handshakes.
     await delay(350);
-    const accepted=Number((await stats()).public_sni.scur);
+    const accepted=Number((await stats())[outer].scur);
     assert.equal(accepted,legacy?24:16,'outer admission did not match the test setup');
     let completed=0;
     for(const socket of sockets){
@@ -44,7 +52,7 @@ async function scenario(legacy){
   }finally{
     for(const c of sockets){if(!c.destroyed)c.resetAndDestroy()}
     for(const c of secured)c.destroy();
-    for(let i=0;i<50;i++){if(Number((await stats()).public_sni.scur)===0)break;await delay(100)}
+    for(let i=0;i<50;i++){if(Number((await stats())[outer].scur)===0)break;await delay(100)}
   }
 }
 try{
@@ -58,4 +66,9 @@ try{
   for(const c of silent)c.destroy();
   assert.equal(closed,6,'silent non-TLS clients outlived the ClientHello inspection timeout');
   console.log('PASS: two-hop admission avoids global-slot starvation; silent clients expire');
-}finally{apply(original);await delay(2200)}
+}finally{
+  apply(original);
+  const section=original.split(`frontend ${outer}\n`)[1];
+  const limit=Number(section.match(/  maxconn (\d+)/)[1]);
+  await waitLimit(limit);
+}

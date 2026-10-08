@@ -35,33 +35,34 @@ import (
 )
 
 type Route struct {
-	MeterID      string `json:"-"`
-	ID           int64  `json:"id"`
-	Name         string `json:"name"`
-	SNI          string `json:"sni"`
-	IP           string `json:"ip"`
-	Port         int    `json:"port"`
-	TLS          bool   `json:"tls"`
-	Verify       bool   `json:"verify"`
-	VerifyName   string `json:"verify_name"`
-	Paused       bool   `json:"paused"`
-	DailyLimit   int64  `json:"daily_limit"`
-	MonthlyLimit int64  `json:"monthly_limit"`
-	CountMode    string `json:"count_mode"`
-	DownBPS      int64  `json:"down_bps"`
-	UpBPS        int64  `json:"up_bps"`
-	Threshold    int    `json:"threshold"`
-	CreatedAt    int64  `json:"created_at"`
-	Status       string `json:"status"`
-	UpTotal      int64  `json:"up_total"`
-	DownTotal    int64  `json:"down_total"`
-	DailyUsed    int64  `json:"daily_used"`
-	DailyExtra   int64  `json:"daily_extra"`
-	MonthlyUsed  int64  `json:"monthly_used"`
-	MonthlyExtra int64  `json:"monthly_extra"`
-	UpRate       int64  `json:"up_rate"`
-	DownRate     int64  `json:"down_rate"`
-	Monitor      bool   `json:"monitor"`
+	MeterID        string `json:"-"`
+	ID             int64  `json:"id"`
+	Name           string `json:"name"`
+	SNI            string `json:"sni"`
+	IP             string `json:"ip"`
+	Port           int    `json:"port"`
+	TLS            bool   `json:"tls"`
+	TLSPassthrough bool   `json:"tls_passthrough"`
+	Verify         bool   `json:"verify"`
+	VerifyName     string `json:"verify_name"`
+	Paused         bool   `json:"paused"`
+	DailyLimit     int64  `json:"daily_limit"`
+	MonthlyLimit   int64  `json:"monthly_limit"`
+	CountMode      string `json:"count_mode"`
+	DownBPS        int64  `json:"down_bps"`
+	UpBPS          int64  `json:"up_bps"`
+	Threshold      int    `json:"threshold"`
+	CreatedAt      int64  `json:"created_at"`
+	Status         string `json:"status"`
+	UpTotal        int64  `json:"up_total"`
+	DownTotal      int64  `json:"down_total"`
+	DailyUsed      int64  `json:"daily_used"`
+	DailyExtra     int64  `json:"daily_extra"`
+	MonthlyUsed    int64  `json:"monthly_used"`
+	MonthlyExtra   int64  `json:"monthly_extra"`
+	UpRate         int64  `json:"up_rate"`
+	DownRate       int64  `json:"down_rate"`
+	Monitor        bool   `json:"monitor"`
 }
 
 type Period struct {
@@ -211,6 +212,7 @@ func main() {
  CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);`)
 	fatal(err)
 	fatal(migrateRouteMonitor(db))
+	fatal(migrateRoutePassthrough(db))
 	token := os.Getenv("PANEL_TOKEN")
 	master := os.Getenv("PANEL_MASTER_KEY")
 	if len(token) < 24 || len(master) < 24 {
@@ -376,15 +378,15 @@ func migrateRouteMonitor(db *sql.DB) error {
 	return err
 }
 func (a *App) loadRoutes() error {
-	rows, err := a.db.Query("SELECT id,name,sni,ip,port,tls,verify,verify_name,paused,daily_limit,monthly_limit,count_mode,down_bps,up_bps,threshold,created_at,up_total,down_total,monitor FROM routes")
+	rows, err := a.db.Query("SELECT id,name,sni,ip,port,tls,verify,verify_name,paused,daily_limit,monthly_limit,count_mode,down_bps,up_bps,threshold,created_at,up_total,down_total,monitor,tls_passthrough FROM routes")
 	if err != nil {
 		return err
 	}
 	loaded := []*RouteState{}
 	for rows.Next() {
 		var r Route
-		var t, v, p, monitor int
-		err = rows.Scan(&r.ID, &r.Name, &r.SNI, &r.IP, &r.Port, &t, &v, &r.VerifyName, &p, &r.DailyLimit, &r.MonthlyLimit, &r.CountMode, &r.DownBPS, &r.UpBPS, &r.Threshold, &r.CreatedAt, &r.UpTotal, &r.DownTotal, &monitor)
+		var t, v, p, monitor, passthrough int
+		err = rows.Scan(&r.ID, &r.Name, &r.SNI, &r.IP, &r.Port, &t, &v, &r.VerifyName, &p, &r.DailyLimit, &r.MonthlyLimit, &r.CountMode, &r.DownBPS, &r.UpBPS, &r.Threshold, &r.CreatedAt, &r.UpTotal, &r.DownTotal, &monitor, &passthrough)
 		if err != nil {
 			_ = rows.Close()
 			return err
@@ -393,6 +395,7 @@ func (a *App) loadRoutes() error {
 		r.Verify = v != 0
 		r.Paused = p != 0
 		r.Monitor = monitor != 0
+		r.TLSPassthrough = passthrough != 0
 		s := &RouteState{Route: r, conns: map[net.Conn]struct{}{}}
 		loaded = append(loaded, s)
 	}

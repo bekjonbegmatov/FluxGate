@@ -15,6 +15,7 @@ import (
 )
 
 type RequestStats struct {
+	HTTPVisible  bool    `json:"http_visible"`
 	RouteID      int64   `json:"route_id"`
 	Requests     int64   `json:"requests"`
 	Responses2xx int64   `json:"responses_2xx"`
@@ -80,6 +81,10 @@ func readHAProxyStats(path string) (map[int64]requestCounter, error) {
 		if field(row, "svname") != "BACKEND" {
 			continue
 		}
+		if field(row, "mode") == "tcp" {
+			// Opaque TLS has no HTTP observations.
+			continue
+		}
 		name := field(row, "pxname")
 		if !strings.HasPrefix(name, "target_") && !strings.HasPrefix(name, "direct_") {
 			continue
@@ -115,8 +120,13 @@ func (a *App) collectRequestStats(now time.Time) {
 	}
 	for id, current := range observed {
 		a.mu.RLock()
-		_, exists := a.routes[id]
+		s, exists := a.routes[id]
 		a.mu.RUnlock()
+		if exists {
+			s.mu.Lock()
+			exists = !s.Route.TLSPassthrough
+			s.mu.Unlock()
+		}
 		if !exists {
 			delete(observed, id)
 			delete(a.liveStats, id)
@@ -195,9 +205,15 @@ func (a *App) requestStatsAPI(w http.ResponseWriter, r *http.Request) {
 	a.statsMu.RUnlock()
 	list := []RequestStats{}
 	a.mu.RLock()
-	for id := range a.routes {
+	for id, s := range a.routes {
 		v := out[id]
 		v.RouteID = id
+		s.mu.Lock()
+		v.HTTPVisible = !s.Route.TLSPassthrough
+		s.mu.Unlock()
+		if !v.HTTPVisible {
+			v.Active, v.Rate, v.ResponseMS, v.UpdatedAt = 0, 0, 0, 0
+		}
 		list = append(list, v)
 	}
 	a.mu.RUnlock()

@@ -96,6 +96,161 @@ def assert_tunnel_closed(tunnel):
     except (ConnectionResetError,ssl.SSLEOFError):
         pass
 
+def tls_rejected(domain):
+    try:
+        with tls_socket(domain):
+            return False
+    except (OSError,ssl.SSLError):
+        return True
+
+def check_passthrough(ip, ids):
+    domain='opaque.example.test'
+    with tempfile.TemporaryDirectory(prefix='fluxgate-origin-tls-') as directory:
+        key,cert=Path(directory)/'key.pem',Path(directory)/'cert.pem'
+        subprocess.run(['openssl','req','-x509','-newkey','ec','-pkeyopt','ec_paramgen_curve:P-256','-nodes',
+                        '-keyout',str(key),'-out',str(cert),'-days','1','-subj','/CN=*.example.test',
+                        '-addext','subjectAltName=DNS:*.example.test'],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        compose('cp',str(key),'origin:/tmp/origin-key.pem')
+        compose('cp',str(cert),'origin:/tmp/origin-cert.pem')
+        certificate=cert.read_text()
+    expected=ssl.PEM_cert_to_DER_cert(certificate)
+    value=api('/routes','POST',dict(name='Opaque TLS',sni='*.example.test',ip=ip,port=8443,tls=True,tls_passthrough=True,
+              verify=False,verify_name='',paused=False,daily_limit=0,monthly_limit=0,count_mode='both',down_bps=0,up_bps=0,threshold=80,monitor=False))
+    rid=value['id']
+    for mode in ['relay','direct']:
+        set_mode(mode,direct_limits=True)
+        frontend='public_direct' if mode=='direct' else 'public_sni'
+        wait_for(lambda:f'{frontend},FRONTEND,' in master_command('@1 show stat'))
+        wait_for(lambda:download(domain)[0]==200)
+        assert route(rid)['tls_passthrough']
+        # Trust only the origin certificate: a panel-generated cert cannot pass.
+        context=ssl.create_default_context(cadata=certificate)
+        context.set_alpn_protocols(['fg-opaque-test'])
+        with context.wrap_socket(socket.create_connection(('127.0.0.1',19443),timeout=5),server_hostname=domain) as connection:
+            assert connection.getpeercert(binary_form=True)==expected
+            assert connection.selected_alpn_protocol()=='fg-opaque-test','proxy changed ALPN'
+        # Exact normal route and primary fallback must beat the opaque wildcard.
+        assert download('route0.example.test')[0]==200
+        assert download('fallback.example.test')[0]==200
+        with tls_socket('route0.example.test') as connection:
+            assert connection.getpeercert(binary_form=True)!=expected
+        wait_for(lambda:f'Maxconn: 200256' in master_command('@1 show info'))
+        if mode=='direct':
+            subprocess.run(COMPOSE+['exec','-T','origin','node','/test/capacity.mjs'],check=True)
+            wait_for(lambda:download(domain)[0]==200)
+
+        # A closed download is counted once, not again at the TCP dispatcher.
+        time.sleep(6)
+        before=route(rid)['down_total']
+        assert download(domain,1024*1024)[0]==200
+        wait_for(lambda:route(rid)['down_total']>=before+1024*1024)
+        assert route(rid)['down_total']<before+2*1024*1024,'passthrough double-counted'
+        tunnel=open_tunnel(domain)
+        before=route(rid)['down_total']
+        update(ids[1],sni=f'passthrough-reload-{mode}.example.test')
+        wait_for(lambda:download(f'passthrough-reload-{mode}.example.test')[0]==200)
+        for _ in range(6):
+            echo_bytes(tunnel,64*1024)
+            time.sleep(1)
+        wait_for(lambda:route(rid)['down_total']>=before+6*64*1024)
+        request_stats=next(s for s in api('/request-stats') if s['route_id']==rid)
+        assert request_stats['http_visible'] is False and request_stats['requests']==0
+        if mode=='direct':
+            before=route(rid)['down_total']
+            compose('restart','-t','45','panel')
+            wait_for(lambda:api('/settings')['proxy_mode']=='direct')
+            echo_bytes(tunnel,512*1024)
+            wait_for(lambda:route(rid)['down_total']>=before+512*1024)
+            assert route(rid)['down_total']<before+1024*1024,'restart doubled passthrough traffic'
+        update(rid,paused=True)
+        wait_for(lambda:tls_rejected(domain))
+        assert_tunnel_closed(tunnel)
+        tunnel.close()
+        update(rid,paused=False)
+        wait_for(lambda:download(domain)[0]==200)
+
+        # A live stream from an old worker must also be stopped by a quota.
+        tunnel=open_tunnel(domain)
+        update(ids[1],sni=f'quota-pass-{mode}.example.test')
+        wait_for(lambda:download(f'quota-pass-{mode}.example.test')[0]==200)
+        update(rid,daily_limit=1)
+        wait_for(lambda:tls_rejected(domain))
+        assert_tunnel_closed(tunnel)
+        tunnel.close()
+        api(f'/routes/{rid}/topup','POST',{'kind':'daily','bytes':route(rid)['daily_used']+1024**2})
+        wait_for(lambda:download(domain)[0]==200)
+        update(rid,daily_limit=0,monthly_limit=1)
+        wait_for(lambda:tls_rejected(domain))
+        api(f'/routes/{rid}/topup','POST',{'kind':'monthly','bytes':route(rid)['monthly_used']+1024**2})
+        wait_for(lambda:download(domain)[0]==200)
+        update(rid,monthly_limit=0,down_bps=128*1024,up_bps=128*1024)
+        time.sleep(4)
+        start=time.monotonic()
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            result=list(pool.map(lambda _:download(domain,128*1024),range(4)))
+        elapsed=time.monotonic()-start
+        assert all(r[0]==200 for r in result) and elapsed>=2,(mode,elapsed)
+        tunnel=open_tunnel(domain)
+        start=time.monotonic()
+        echo_bytes(tunnel,256*1024)
+        assert time.monotonic()-start>=1,'passthrough tunnel bypassed shaping'
+        tunnel.close()
+        update(rid,down_bps=0,up_bps=0)
+        wait_for(lambda:download(domain)[0]==200)
+        if mode=='relay':
+            # Exercise exhaustion during copying, not just admission rejection.
+            limit=route(rid)['daily_used']+128*1024
+            update(rid,daily_limit=limit)
+            # Daily topup from above is still valid: consume beyond the total.
+            effective=limit+route(rid)['daily_extra']
+            try:
+                download(domain,effective-route(rid)['daily_used']+1024**2)
+                raise AssertionError('passthrough relay exceeded its quota')
+            except (OSError,http.client.HTTPException,TruncatedDownload):
+                pass
+            wait_for(lambda:tls_rejected(domain))
+            assert route(rid)['daily_used']<=effective
+            update(rid,daily_limit=0)
+        if mode=='direct':
+            # Limits remain opt-in for opaque routes, just like ordinary ones.
+            set_mode('direct',direct_limits=False)
+            update(rid,daily_limit=1,down_bps=1)
+            assert download(domain,2*1024**2)[0]==200
+            set_mode('direct',direct_limits=True)
+            wait_for(lambda:tls_rejected(domain))
+            update(rid,daily_limit=0,down_bps=0)
+            wait_for(lambda:download(domain)[0]==200)
+            update(rid,daily_limit=route(rid)['daily_used']+1024**3)
+            wait_for(lambda:download(domain)[0]==200)
+            tunnel=open_tunnel(domain)
+            update(ids[1],sni='passthrough-watchdog.example.test')
+            wait_for(lambda:download('passthrough-watchdog.example.test')[0]==200)
+            compose('pause','panel')
+            try:
+                wait_for(lambda:tls_rejected(domain),25)
+                assert download('route0.example.test')[0]==200
+                assert_tunnel_closed(tunnel)
+            finally:
+                compose('unpause','panel')
+                tunnel.close()
+            wait_for(lambda:download(domain)[0]==200)
+            update(rid,daily_limit=0)
+        print(f'PASS: {mode} TLS identity, exact/wildcard SNI, live accounting, reload, pause, quotas/topup, shared shaping ({elapsed:.2f}s)',flush=True)
+    # New field survives the real backup/restore path as well as agent restart.
+    with opener.open('http://127.0.0.1:19389/admin/api/backup',timeout=30) as response:
+        backup=response.read()
+    update(rid,tls_passthrough=False)
+    before=api('/system')['process_started_at']
+    req=urllib.request.Request('http://127.0.0.1:19389/admin/api/restore',data=backup,headers={'Content-Type':'application/zip'})
+    with opener.open(req,timeout=30) as response: assert response.status==202
+    wait_for(lambda:api('/system')['process_started_at']!=before,60)
+    assert route(rid)['tls_passthrough']
+    wait_for(lambda:download(domain)[0]==200)
+    api(f'/routes/{rid}','DELETE')
+    set_mode('relay')
+    wait_for(lambda:download('route0.example.test')[0]==200)
+    print('PASS: passthrough backup/restore and removal of mixed dispatcher',flush=True)
+
 def check_direct_limits(ids):
     # Old direct settings remain opt-in; enabling must enforce existing usage.
     set_mode('direct',direct_limits=True)
@@ -395,6 +550,7 @@ def main(seconds, history_days):
         wait_for(lambda:download("route0.example.test")[0]==200)
 
         check_direct(ids, load=seconds>0)
+        check_passthrough(ip,ids)
 
         if seconds == 0:
             wait_for(lambda:api('/system')['relay_connections']==0,40)

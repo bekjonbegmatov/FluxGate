@@ -11,6 +11,11 @@ import (
 )
 
 func TestBackupRestoreRoundTrip(t *testing.T) {
+	for _, passthrough := range []bool{false, true} {
+		t.Run(map[bool]string{false: "legacy", true: "passthrough"}[passthrough], func(t *testing.T) { testBackupRestoreRoundTrip(t, passthrough) })
+	}
+}
+func testBackupRestoreRoundTrip(t *testing.T, passthrough bool) {
 	source := t.TempDir()
 	if e := os.Mkdir(filepath.Join(source, "certs"), 0700); e != nil {
 		t.Fatal(e)
@@ -25,6 +30,14 @@ func TestBackupRestoreRoundTrip(t *testing.T) {
 		t.Fatal(e)
 	}
 	a := &App{db: db, data: source, domain: "example.com", location: time.UTC, master: []byte("original master key with enough length"), routes: map[int64]*RouteState{}, tg: TelegramSettings{BotToken: "telegram-secret"}}
+	if passthrough {
+		if e = migrateRoutePassthrough(db); e != nil {
+			t.Fatal(e)
+		}
+		if _, e = db.Exec("UPDATE routes SET tls=1,tls_passthrough=1"); e != nil {
+			t.Fatal(e)
+		}
+	}
 	if e = a.initFinance(); e != nil {
 		t.Fatal(e)
 	}
@@ -76,6 +89,10 @@ func TestBackupRestoreRoundTrip(t *testing.T) {
 	}
 	defer restored.Close()
 	other.db = restored
+	var flag int
+	if e = restored.QueryRow("SELECT tls_passthrough FROM routes WHERE id=1").Scan(&flag); e != nil || flag != boolInt(passthrough) {
+		t.Fatal("restored transport", flag, e)
+	}
 	if got := other.getSetting("direct_limits", ""); got != "true" {
 		t.Fatalf("direct limits lost: %q", got)
 	}

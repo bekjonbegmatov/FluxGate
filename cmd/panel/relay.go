@@ -163,9 +163,10 @@ func (a *App) handleConn(s *RouteState, client net.Conn) {
 	if a.closing.Load() {
 		return
 	}
+	var r Route
 	if s != nil {
 		s.mu.Lock()
-		r := s.Route
+		r = s.Route
 		blocked, deleted := s.blocked(), s.deleted
 		s.mu.Unlock()
 		if deleted {
@@ -177,8 +178,12 @@ func (a *App) handleConn(s *RouteState, client net.Conn) {
 			return
 		}
 	}
-	address, releaseIngress := a.relayIngress.acquire()
-	defer releaseIngress()
+	address := net.JoinHostPort(r.IP, fmt.Sprint(r.Port))
+	if !r.TLSPassthrough {
+		var releaseIngress func()
+		address, releaseIngress = a.relayIngress.acquire()
+		defer releaseIngress()
+	}
 	upstream, err := net.DialTimeout("tcp", address, 5*time.Second)
 	if err != nil {
 		return
@@ -187,7 +192,8 @@ func (a *App) handleConn(s *RouteState, client net.Conn) {
 	defer pair.Close()
 	if s != nil {
 		s.mu.Lock()
-		if a.closing.Load() || s.deleted || s.Route.Paused || s.blocked() {
+		if a.closing.Load() || s.deleted || s.Route.Paused || s.blocked() ||
+			s.Route.TLSPassthrough != r.TLSPassthrough || s.Route.IP != r.IP || s.Route.Port != r.Port {
 			s.mu.Unlock()
 			return
 		}
@@ -204,6 +210,11 @@ func (a *App) handleConn(s *RouteState, client net.Conn) {
 	a.relayDuplex(s, pair)
 }
 func (a *App) rejectConn(client net.Conn, r Route) {
+	// A passthrough endpoint must never impersonate the origin, even to return
+	// a quota error. Closing TCP is the only response without terminating TLS.
+	if r.TLSPassthrough {
+		return
+	}
 	certPath := filepath.Join(a.data, "certs", routeCert(r)+".pem")
 	cert, err := tls.LoadX509KeyPair(certPath, certPath)
 	if err != nil {

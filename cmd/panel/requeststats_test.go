@@ -1,13 +1,36 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"net"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 )
+
+func TestPassthroughRequestStatsRetainHistoryButHideLiveHTTP(t *testing.T) {
+	a, s := trafficApp(t)
+	if err := a.initRequestStats(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.db.Exec("INSERT INTO request_totals(route_id,requests,r2) VALUES(1,123,123)"); err != nil {
+		t.Fatal(err)
+	}
+	a.liveStats = map[int64]RequestStats{1: {Rate: 12, Active: 3, ResponseMS: 5, UpdatedAt: 100}}
+	s.Route.TLSPassthrough = true
+	w := httptest.NewRecorder()
+	a.requestStatsAPI(w, httptest.NewRequest("GET", "/admin/api/request-stats", nil))
+	var result []RequestStats
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if len(result) != 1 || result[0].HTTPVisible || result[0].Requests != 123 || result[0].Rate != 0 || result[0].Active != 0 || result[0].UpdatedAt != 0 {
+		t.Fatal("misleading opaque HTTP statistics", result)
+	}
+}
 
 func TestReadHAProxyStats(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "stats.sock")
@@ -24,7 +47,7 @@ func TestReadHAProxyStats(t *testing.T) {
 		defer c.Close()
 		b := make([]byte, 64)
 		_, _ = c.Read(b)
-		_, _ = c.Write([]byte("# pxname,svname,req_tot,hrsp_2xx,hrsp_3xx,hrsp_4xx,hrsp_5xx,scur,rtime\ntarget_7,BACKEND,42,30,3,4,5,2,16\nfallback_page,BACKEND,11,1,0,0,0,0,0\n"))
+		_, _ = c.Write([]byte("# pxname,svname,req_tot,hrsp_2xx,hrsp_3xx,hrsp_4xx,hrsp_5xx,scur,rtime,mode\ntarget_7,BACKEND,42,30,3,4,5,2,16,http\ndirect_8_abcdef,BACKEND,20,0,0,0,0,2,0,tcp\nfallback_page,BACKEND,11,1,0,0,0,0,0,http\n"))
 	}()
 	got, e := readHAProxyStats(path)
 	if e != nil {

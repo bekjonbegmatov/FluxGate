@@ -222,6 +222,9 @@ func validateRoute(v *Route) error {
 	if v.Verify && (!v.TLS || !validDomain(v.VerifyName)) {
 		return fmt.Errorf("verified HTTPS requires a certificate name")
 	}
+	if v.TLSPassthrough && (!v.TLS || v.Verify) {
+		return fmt.Errorf("TLS passthrough requires a TLS upstream; certificate verification belongs to the client")
+	}
 	if v.DailyLimit < 0 || v.MonthlyLimit < 0 || v.DownBPS < 0 || v.UpBPS < 0 {
 		return fmt.Errorf("limits cannot be negative")
 	}
@@ -245,7 +248,7 @@ func (a *App) createRoute(w http.ResponseWriter, v Route) {
 	// Read-only counters in a POST are never accepted as initial usage.
 	v.UpTotal, v.DownTotal = 0, 0
 	v.CreatedAt = time.Now().Unix()
-	result, e := a.db.Exec("INSERT INTO routes(name,sni,ip,port,tls,verify,verify_name,paused,daily_limit,monthly_limit,count_mode,down_bps,up_bps,threshold,created_at,monitor) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", v.Name, v.SNI, v.IP, v.Port, boolInt(v.TLS), boolInt(v.Verify), v.VerifyName, boolInt(v.Paused), v.DailyLimit, v.MonthlyLimit, v.CountMode, v.DownBPS, v.UpBPS, v.Threshold, v.CreatedAt, boolInt(v.Monitor))
+	result, e := a.db.Exec("INSERT INTO routes(name,sni,ip,port,tls,verify,verify_name,paused,daily_limit,monthly_limit,count_mode,down_bps,up_bps,threshold,created_at,monitor,tls_passthrough) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", v.Name, v.SNI, v.IP, v.Port, boolInt(v.TLS), boolInt(v.Verify), v.VerifyName, boolInt(v.Paused), v.DailyLimit, v.MonthlyLimit, v.CountMode, v.DownBPS, v.UpBPS, v.Threshold, v.CreatedAt, boolInt(v.Monitor), boolInt(v.TLSPassthrough))
 	if e != nil {
 		fail(w, 409, e.Error())
 		return
@@ -270,7 +273,7 @@ func (a *App) createRoute(w http.ResponseWriter, v Route) {
 	a.mu.Lock()
 	a.routes[v.ID] = s
 	a.mu.Unlock()
-	if e = a.ensureCert(routeCert(v), v.SNI); e == nil {
+	if e = a.ensureRouteCert(v); e == nil {
 		e = a.listenRoute(s)
 	}
 	if e == nil {
@@ -313,14 +316,22 @@ func (a *App) routeAPI(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case "PUT":
-		var v Route
-		if readJSON(r, &v) != nil {
+		var input struct {
+			Route
+			Passthrough *bool `json:"tls_passthrough"`
+		}
+		if readJSON(r, &input) != nil {
 			fail(w, 400, "invalid JSON")
 			return
 		}
+		v := input.Route
 		v.ID = id
 		s.mu.Lock()
 		old := s.Route
+		v.TLSPassthrough = old.TLSPassthrough
+		if input.Passthrough != nil {
+			v.TLSPassthrough = *input.Passthrough
+		}
 		v.CreatedAt = old.CreatedAt
 		v.MeterID = old.MeterID
 		v.UpTotal = old.UpTotal
@@ -346,7 +357,7 @@ func (a *App) routeAPI(w http.ResponseWriter, r *http.Request) {
 		rearmQuota(&s.Daily, v.DailyLimit+s.Daily.Extra, v.Threshold)
 		rearmQuota(&s.Monthly, v.MonthlyLimit+s.Monthly.Extra, v.Threshold)
 		s.mu.Unlock()
-		if e = a.ensureCert(routeCert(v), v.SNI); e == nil {
+		if e = a.ensureRouteCert(v); e == nil {
 			e = a.writeConfig()
 		}
 		if e != nil {
@@ -356,7 +367,7 @@ func (a *App) routeAPI(w http.ResponseWriter, r *http.Request) {
 			fail(w, 400, e.Error())
 			return
 		}
-		_, e = a.db.Exec("UPDATE routes SET name=?,sni=?,ip=?,port=?,tls=?,verify=?,verify_name=?,paused=?,daily_limit=?,monthly_limit=?,count_mode=?,down_bps=?,up_bps=?,threshold=?,monitor=? WHERE id=?", v.Name, v.SNI, v.IP, v.Port, boolInt(v.TLS), boolInt(v.Verify), v.VerifyName, boolInt(v.Paused), v.DailyLimit, v.MonthlyLimit, v.CountMode, v.DownBPS, v.UpBPS, v.Threshold, boolInt(v.Monitor), id)
+		_, e = a.db.Exec("UPDATE routes SET name=?,sni=?,ip=?,port=?,tls=?,verify=?,verify_name=?,paused=?,daily_limit=?,monthly_limit=?,count_mode=?,down_bps=?,up_bps=?,threshold=?,monitor=?,tls_passthrough=? WHERE id=?", v.Name, v.SNI, v.IP, v.Port, boolInt(v.TLS), boolInt(v.Verify), v.VerifyName, boolInt(v.Paused), v.DailyLimit, v.MonthlyLimit, v.CountMode, v.DownBPS, v.UpBPS, v.Threshold, boolInt(v.Monitor), boolInt(v.TLSPassthrough), id)
 		if e != nil {
 			s.mu.Lock()
 			s.restoreRoute(old, oldDaily, oldMonthly)
@@ -365,7 +376,7 @@ func (a *App) routeAPI(w http.ResponseWriter, r *http.Request) {
 			fail(w, 500, e.Error())
 			return
 		}
-		if v.Paused {
+		if v.Paused || v.TLSPassthrough != old.TLSPassthrough {
 			a.closeRouteConns(s)
 		}
 		s.mu.Lock()

@@ -289,27 +289,41 @@ func (a *App) stageRestore(src io.Reader) (string, error) {
 			return "", fmt.Errorf("invalid route meter identity in backup")
 		}
 	}
-	rows, e := db.Query("SELECT id,name,sni,ip,port,tls,verify,verify_name,paused,daily_limit,monthly_limit,count_mode,down_bps,up_bps,threshold FROM routes")
+	// Only the isolated staging DB is migrated, never the uploaded/source DB.
+	if e = migrateRoutePassthrough(db); e != nil {
+		return "", e
+	}
+	rows, e := db.Query("SELECT id,name,sni,ip,port,tls,verify,verify_name,paused,daily_limit,monthly_limit,count_mode,down_bps,up_bps,threshold,tls_passthrough FROM routes")
 	if e != nil {
 		return "", e
 	}
 	for rows.Next() {
 		var r Route
-		var tls, verify, paused int
-		e = rows.Scan(&r.ID, &r.Name, &r.SNI, &r.IP, &r.Port, &tls, &verify, &r.VerifyName, &paused, &r.DailyLimit, &r.MonthlyLimit, &r.CountMode, &r.DownBPS, &r.UpBPS, &r.Threshold)
+		var tls, verify, paused, passthrough int
+		e = rows.Scan(&r.ID, &r.Name, &r.SNI, &r.IP, &r.Port, &tls, &verify, &r.VerifyName, &paused, &r.DailyLimit, &r.MonthlyLimit, &r.CountMode, &r.DownBPS, &r.UpBPS, &r.Threshold, &passthrough)
 		if e != nil {
 			break
 		}
 		r.TLS = tls != 0
 		r.Verify = verify != 0
 		r.Paused = paused != 0
+		r.TLSPassthrough = passthrough != 0
+		if passthrough != 0 && passthrough != 1 {
+			e = fmt.Errorf("invalid tls_passthrough in backup")
+			break
+		}
 		if e = validateRoute(&r); e != nil {
 			break
 		}
-		if r.SNI == manifest.Domain || (strings.HasPrefix(r.SNI, "*.") && strings.HasSuffix(manifest.Domain, r.SNI[1:])) {
+		// Match create/update validation: an overlapping wildcard is safe;
+		// the primary-domain ACL always precedes route ACLs in both frontends.
+		if r.SNI == manifest.Domain {
 			e = fmt.Errorf("main domain conflicts with route")
 			break
 		}
+	}
+	if e == nil {
+		e = rows.Err()
 	}
 	rows.Close()
 	if e != nil {
